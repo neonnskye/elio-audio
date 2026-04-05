@@ -1,8 +1,5 @@
 #include <Arduino.h>
-#include <WiFiManager.h>
 #include <driver/i2s.h>
-
-#define ledPin 2
 
 // you shouldn't need to change these settings
 #define SAMPLE_BUFFER_SIZE 512
@@ -35,18 +32,10 @@ i2s_pin_config_t i2s_mic_pins = {
     .data_out_num = I2S_PIN_NO_CHANGE,
     .data_in_num = I2S_MIC_SERIAL_DATA};
 
-WiFiManager wifiManager;
-
 void setup()
 {
+  // we need serial output for the plotter
   Serial.begin(115200);
-  delay(1000);
-
-  pinMode(ledPin, OUTPUT);
-
-  // wifiManager.resetSettings(); // for debugging
-  wifiManager.autoConnect("Amrith's NodeMCU-32S", "pacman@123");
-
   // start up the I2S peripheral
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
@@ -55,11 +44,6 @@ void setup()
 int32_t raw_samples[SAMPLE_BUFFER_SIZE];
 void loop()
 {
-  digitalWrite(ledPin, HIGH);
-  delay(1000);
-  digitalWrite(ledPin, LOW);
-  delay(1000);
-
   // read from the I2S device
   size_t bytes_read = 0;
   i2s_read(I2S_NUM_0, raw_samples, sizeof(int32_t) * SAMPLE_BUFFER_SIZE, &bytes_read, portMAX_DELAY);
