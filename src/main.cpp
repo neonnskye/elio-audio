@@ -5,9 +5,9 @@
 #include "driver/adc.h"
 
 // ---- User configuration ----
-#define WIFI_SSID "Slt2657"
-#define WIFI_PASSWORD "Amrith@123"
-#define PC_IP "192.168.1.54"
+#define WIFI_SSID "Amrith’s iPhone"
+#define WIFI_PASSWORD "brat summer"
+#define PC_IP "172.20.10.5"
 #define UDP_PORT 12345
 // ----------------------------
 
