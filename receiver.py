@@ -20,9 +20,9 @@ NOISE_GATE      = 0.02 # RMS threshold below which a packet is muted (0 = off)
 # -----------------------
 
 # Whisper config
-WHISPER_MODEL   = "base"       # tiny / base / small — tradeoff speed vs accuracy
-WHISPER_DEVICE  = "cpu"        # or "cuda" if you have a GPU
-WHISPER_COMPUTE = "int8"       # int8 = fastest on CPU
+WHISPER_MODEL   = "small"       # tiny / base / small — tradeoff speed vs accuracy
+WHISPER_DEVICE  = "cuda"        # or "cuda" if you have a GPU
+WHISPER_COMPUTE = "float16"       # int8 = fastest on CPU
 
 # VAD / segmentation config
 VAD_SILENCE_MS  = 700          # ms of silence before we consider speech done
