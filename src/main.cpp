@@ -86,7 +86,10 @@ void setup()
 void loop()
 {
     if (readyBuf < 0)
+    {
+        delay(1); // yield to lwIP task when nothing to send
         return;
+    }
 
     int toSend;
     portENTER_CRITICAL(&mux);
@@ -95,8 +98,8 @@ void loop()
 
     if (udp.beginPacket(PC_IP, UDP_PORT) == 0)
     {
-        // beginPacket failed — will retry next iteration
         packetsFailed++;
+        delay(5); // back off before retrying
         return;
     }
 
@@ -104,17 +107,16 @@ void loop()
 
     if (udp.endPacket() != 0)
     {
-        // Send succeeded — mark buffer as consumed
         portENTER_CRITICAL(&mux);
         readyBuf = -1;
         portEXIT_CRITICAL(&mux);
         packetsSent++;
-        yield();
+        // no yield() needed here — delay(1) at top handles idle
     }
     else
     {
-        // Send failed — packet not consumed, will retry next iteration
         packetsFailed++;
+        delay(5); // give lwIP time to free pbufs before next attempt
     }
 
     static uint32_t lastPrint = 0;
