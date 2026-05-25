@@ -36,6 +36,7 @@ typedef struct
 } ei_inference_t;
 
 static ei_inference_t ei_inf;
+static TaskHandle_t inferenceTaskHandle = NULL;
 
 // ISR: fires at exactly 16 000 Hz, reads one ADC sample, swaps buffer when full.
 // adc1_get_raw() is called outside the spinlock to keep the critical section minimal.
@@ -61,7 +62,10 @@ void IRAM_ATTR onTimer()
     {
         ei_inf.buf_select ^= 1;
         ei_inf.buf_count = 0;
-        ei_inf.buf_ready = 1;
+        // Notify inference task instead of setting a flag
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(inferenceTaskHandle, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
 
     portEXIT_CRITICAL_ISR(&mux);
@@ -69,9 +73,11 @@ void IRAM_ATTR onTimer()
 
 static int ei_get_data(size_t offset, size_t length, float *out_ptr)
 {
-    // Read from the buffer that just finished (not the one being written)
     uint8_t done_buf = ei_inf.buf_select ^ 1;
-    numpy::int16_to_float(&ei_inf.buffers[done_buf][offset], out_ptr, length);
+    for (size_t i = 0; i < length; i++)
+    {
+        out_ptr[i] = (float)ei_inf.buffers[done_buf][offset + i] / 2048.0f;
+    }
     return 0;
 }
 
@@ -80,15 +86,19 @@ static int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
 void inferenceTask(void *arg)
 {
     static bool debug_nn = false;
+    static uint32_t ledOffAt = 0;
 
     while (true)
     {
-        // Wait for a slice to be ready
-        while (ei_inf.buf_ready == 0)
+        // Block indefinitely until the ISR sends a notification
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // Turn off LED if blink duration has elapsed (non-blocking)
+        if (ledOffAt > 0 && millis() >= ledOffAt)
         {
-            vTaskDelay(1 / portTICK_PERIOD_MS);
+            digitalWrite(LED_BUILTIN, LOW);
+            ledOffAt = 0;
         }
-        ei_inf.buf_ready = 0;
 
         signal_t signal;
         signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
@@ -110,18 +120,16 @@ void inferenceTask(void *arg)
                               result.classification[i].label,
                               result.classification[i].value);
 
-                // Detect wake word — adjust label name and threshold to match yours
-                if (strcmp(result.classification[i].label, "elio") == 0 && result.classification[i].value > 0.6f)
+                if (strcmp(result.classification[i].label, "elio") == 0 &&
+                    result.classification[i].value > 0.6f)
                 {
                     Serial.println(">>> WAKE WORD DETECTED <<<");
                     digitalWrite(LED_BUILTIN, HIGH);
-                    vTaskDelay(500 / portTICK_PERIOD_MS);
-                    digitalWrite(LED_BUILTIN, LOW);
+                    ledOffAt = millis() + 500; // schedule off, don't block
                 }
             }
             print_results = 0;
         }
-        taskYIELD();
     }
 }
 
@@ -169,7 +177,7 @@ void setup()
     digitalWrite(LED_BUILTIN, LOW);
 
     // Start inference task on core 0 (WiFi/UDP runs on core 1 by default)
-    xTaskCreatePinnedToCore(inferenceTask, "EI_Infer", 1024 * 32, NULL, 0, NULL, 0);
+    xTaskCreatePinnedToCore(inferenceTask, "EI_Infer", 1024 * 48, NULL, 1, &inferenceTaskHandle, 0);
 
     // Timer 0: 80 MHz / prescaler 5 = 16 MHz base clock
     // Alarm at 1000 counts → 16 MHz / 1000 = exactly 16 000 Hz
@@ -189,19 +197,24 @@ void loop()
 {
     if (readyBuf < 0)
     {
-        delay(1); // yield to lwIP task when nothing to send
+        delay(1);
         return;
     }
 
+    // Atomically claim and clear readyBuf before doing any UDP work
     int toSend;
     portENTER_CRITICAL(&mux);
     toSend = readyBuf;
+    readyBuf = -1; // clear immediately so ISR can reuse the slot
     portEXIT_CRITICAL(&mux);
+
+    if (toSend < 0)
+        return; // another core beat us here (defensive)
 
     if (udp.beginPacket(PC_IP, UDP_PORT) == 0)
     {
         packetsFailed++;
-        delay(5); // back off before retrying
+        delay(5);
         return;
     }
 
@@ -209,16 +222,12 @@ void loop()
 
     if (udp.endPacket() != 0)
     {
-        portENTER_CRITICAL(&mux);
-        readyBuf = -1;
-        portEXIT_CRITICAL(&mux);
         packetsSent++;
-        // no yield() needed here — delay(1) at top handles idle
     }
     else
     {
         packetsFailed++;
-        delay(5); // give lwIP time to free pbufs before next attempt
+        delay(5);
     }
 
     static uint32_t lastPrint = 0;
