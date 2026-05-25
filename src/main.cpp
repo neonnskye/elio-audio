@@ -44,6 +44,10 @@ void IRAM_ATTR onTimer()
 {
     uint16_t sample = (uint16_t)adc1_get_raw(ADC1_CHANNEL_7);
 
+    // Do arithmetic OUTSIDE the lock
+    // (cheap optimization, avoids extra work while holding spinlock)
+    int16_t s16 = (int16_t)(sample - 2048) * 16;
+
     portENTER_CRITICAL_ISR(&mux);
 
     // UDP buffer
@@ -56,16 +60,21 @@ void IRAM_ATTR onTimer()
     }
 
     // EI inference buffer
-    int16_t s16 = (int16_t)(sample - 2048) * 16;
     ei_inf.buffers[ei_inf.buf_select][ei_inf.buf_count++] = s16;
+
     if (ei_inf.buf_count >= ei_inf.n_samples)
     {
         ei_inf.buf_select ^= 1;
         ei_inf.buf_count = 0;
+
         // Notify inference task instead of setting a flag
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         vTaskNotifyGiveFromISR(inferenceTaskHandle, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+
+        if (xHigherPriorityTaskWoken)
+        {
+            portYIELD_FROM_ISR();
+        }
     }
 
     portEXIT_CRITICAL_ISR(&mux);
