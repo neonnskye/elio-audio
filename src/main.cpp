@@ -12,6 +12,7 @@
 #define WIFI_PASSWORD "brat summer"
 #define PC_IP "172.20.10.5"
 #define UDP_PORT 12345
+#define CTRL_UDP_PORT 12346
 // ----------------------------
 
 #define SAMPLES_PER_PKT 512
@@ -92,6 +93,9 @@ static int ei_get_data(size_t offset, size_t length, float *out_ptr)
 
 static int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
 
+WiFiUDP udp;
+WiFiUDP ctrlUdp;
+
 void inferenceTask(void *arg)
 {
     static bool debug_nn = false;
@@ -135,6 +139,12 @@ void inferenceTask(void *arg)
                     Serial.println(">>> WAKE WORD DETECTED <<<");
                     digitalWrite(LED_BUILTIN, HIGH);
                     ledOffAt = millis() + 500; // schedule off, don't block
+
+                    // Notify Python server that wake word was detected
+                    uint8_t trigByte = 0x01;
+                    ctrlUdp.beginPacket(PC_IP, CTRL_UDP_PORT);
+                    ctrlUdp.write(&trigByte, 1);
+                    ctrlUdp.endPacket();
                 }
             }
             print_results = 0;
@@ -142,7 +152,6 @@ void inferenceTask(void *arg)
     }
 }
 
-WiFiUDP udp;
 uint32_t packetsSent = 0;
 uint32_t packetsFailed = 0;
 
