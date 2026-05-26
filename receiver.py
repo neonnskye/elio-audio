@@ -31,7 +31,7 @@ SAMPLE_RATE = 16000
 SAMPLES_PER_PKT = 512
 PREBUFFER_PKTS = 3  # Packets to queue before starting playback (~96ms)
 MAX_QUEUE_LEN = 10  # Drop oldest if queue grows beyond this (~320ms)
-NOISE_GATE = 0.02  # RMS threshold below which a packet is muted (0 = off)
+NOISE_GATE = 0  # RMS threshold below which a packet is muted (0 = off)
 VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered silence
 # -----------------------
 
@@ -200,23 +200,23 @@ def receive_loop(sock: socket.socket) -> None:
     while True:
         data, _ = sock.recvfrom(expected_bytes * 2)
         if len(data) != expected_bytes:
-            continue  # drop malformed packets
+            continue
         raw = np.frombuffer(data, dtype="<u2").astype(np.float32)
-        # Normalize to [-1.0, 1.0] using assumed midpoint, then remove actual DC offset
-        # by subtracting the per-packet mean (corrects for mic bias voltage error)
         audio = (raw - 2048.0) / 2048.0
         audio = audio - np.mean(audio)
-        # Noise gate: mute packets below RMS threshold (kills ADC idle noise)
-        # Apply to playback queue only — VAD needs the original audio for detection
+
+        # Noise gate: only applies to playback if you want to suppress idle hiss.
+        # For full-fidelity recording/monitoring, set NOISE_GATE = 0 or remove this block.
         if NOISE_GATE > 0 and np.sqrt(np.mean(audio ** 2)) < NOISE_GATE:
             playback_audio = np.zeros(SAMPLES_PER_PKT, dtype=np.float32)
         else:
             playback_audio = audio
+
         with queue_lock:
             if len(packet_queue) >= MAX_QUEUE_LEN:
                 packet_queue.popleft()
-            packet_queue.append(playback_audio)
-            vad_queue.append(audio)  # <-- original audio (not zeroed)
+            packet_queue.append(playback_audio)   # <-- was using gated audio
+            vad_queue.append(audio)
             if len(vad_queue) > MAX_QUEUE_LEN * 4:
                 vad_queue.popleft()
 
