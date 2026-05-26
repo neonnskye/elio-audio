@@ -32,6 +32,7 @@ SAMPLES_PER_PKT = 512
 PREBUFFER_PKTS = 3  # Packets to queue before starting playback (~96ms)
 MAX_QUEUE_LEN = 10  # Drop oldest if queue grows beyond this (~320ms)
 NOISE_GATE = 0.02  # RMS threshold below which a packet is muted (0 = off)
+VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered silence
 # -----------------------
 
 # Whisper config
@@ -40,7 +41,7 @@ WHISPER_DEVICE = "cuda"  # or "cuda" if you have a GPU
 WHISPER_COMPUTE = "float16"  # int8 = fastest on CPU
 
 # VAD / segmentation config
-VAD_SILENCE_MS = 700  # ms of silence before we consider speech done
+VAD_SILENCE_MS = 500  # ms of silence before we consider speech done
 VAD_MIN_SPEECH_MS = 400  # ignore speech segments shorter than this
 MAX_SEGMENT_S = 10  # hard cap — transcribe even if no silence detected
 # -----------------------
@@ -64,7 +65,6 @@ transcribe_queue: queue.Queue = queue.Queue()
 # --- VAD accumulator state ---
 accumulator: list[np.ndarray] = []
 silence_packets = 0
-SILENCE_THRESHOLD = NOISE_GATE  # reuse your existing threshold
 SILENCE_PACKETS_MAX = int((VAD_SILENCE_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_PKT)
 MIN_SPEECH_PACKETS = int((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_PKT)
 MAX_SEGMENT_PACKETS = int(MAX_SEGMENT_S * SAMPLE_RATE / SAMPLES_PER_PKT)
@@ -130,7 +130,7 @@ def vad_accumulator_loop() -> None:
 
         # --- CAPTURING: normal VAD logic ---
         rms = float(np.sqrt(np.mean(chunk ** 2)))
-        is_speech = rms >= SILENCE_THRESHOLD
+        is_speech = rms >= VAD_SILENCE_THRESHOLD
 
         if rms > 0.001:
             sys.stdout.write(f"\rVAD RMS={rms:.4f} speech={is_speech} acc_len={len(accumulator)} ")
@@ -202,8 +202,10 @@ def receive_loop(sock: socket.socket) -> None:
         if len(data) != expected_bytes:
             continue  # drop malformed packets
         raw = np.frombuffer(data, dtype="<u2").astype(np.float32)
-        # Remove DC offset (ADC midpoint = 2048) and normalize to [-1.0, 1.0]
+        # Normalize to [-1.0, 1.0] using assumed midpoint, then remove actual DC offset
+        # by subtracting the per-packet mean (corrects for mic bias voltage error)
         audio = (raw - 2048.0) / 2048.0
+        audio = audio - np.mean(audio)
         # Noise gate: mute packets below RMS threshold (kills ADC idle noise)
         # Apply to playback queue only — VAD needs the original audio for detection
         if NOISE_GATE > 0 and np.sqrt(np.mean(audio ** 2)) < NOISE_GATE:
