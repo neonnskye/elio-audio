@@ -36,7 +36,7 @@ VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered
 # -----------------------
 
 # Whisper config
-WHISPER_MODEL = "small"  # tiny / base / small — tradeoff speed vs accuracy
+WHISPER_MODEL = "turbo"  # tiny / base / small — tradeoff speed vs accuracy
 WHISPER_DEVICE = "cuda"  # or "cuda" if you have a GPU
 WHISPER_COMPUTE = "float16"  # int8 = fastest on CPU
 
