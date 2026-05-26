@@ -16,40 +16,42 @@ def ts() -> str:
     """Return a human-readable timestamp string."""
     return datetime.now().strftime("[%H:%M:%S.%f")[:-3] + "]"
 
+
 class ListenState(Enum):
-    IDLE = auto()                  # waiting for wake word signal
-    SKIP_WAKEWORD_BLEED = auto()   # discarding audio bleed from the wake word utterance itself
-    CAPTURING = auto()             # actively recording the user's command
-    TRANSCRIBING = auto()          # Whisper is processing, block new captures
+    IDLE = auto()  # waiting for wake word signal
+    SKIP_WAKEWORD_BLEED = auto()  # discarding audio bleed from the wake word utterance itself
+    CAPTURING = auto()  # actively recording the user's command
+    TRANSCRIBING = auto()  # Whisper is processing, block new captures
+
 
 # ---- Configuration ----
-UDP_IP          = "0.0.0.0"  # Listen on all interfaces
-UDP_PORT        = 12345
-SAMPLE_RATE     = 16000
+UDP_IP = "0.0.0.0"  # Listen on all interfaces
+UDP_PORT = 12345
+SAMPLE_RATE = 16000
 SAMPLES_PER_PKT = 512
-PREBUFFER_PKTS  = 3    # Packets to queue before starting playback (~96ms)
-MAX_QUEUE_LEN   = 10   # Drop oldest if queue grows beyond this (~320ms)
-NOISE_GATE      = 0.02 # RMS threshold below which a packet is muted (0 = off)
+PREBUFFER_PKTS = 3  # Packets to queue before starting playback (~96ms)
+MAX_QUEUE_LEN = 10  # Drop oldest if queue grows beyond this (~320ms)
+NOISE_GATE = 0.02  # RMS threshold below which a packet is muted (0 = off)
 # -----------------------
 
 # Whisper config
-WHISPER_MODEL   = "base"       # tiny / base / small — tradeoff speed vs accuracy
-WHISPER_DEVICE  = "cuda"        # or "cuda" if you have a GPU
-WHISPER_COMPUTE = "float16"       # int8 = fastest on CPU
+WHISPER_MODEL = "base"  # tiny / base / small — tradeoff speed vs accuracy
+WHISPER_DEVICE = "cuda"  # or "cuda" if you have a GPU
+WHISPER_COMPUTE = "float16"  # int8 = fastest on CPU
 
 # VAD / segmentation config
-VAD_SILENCE_MS  = 700          # ms of silence before we consider speech done
-VAD_MIN_SPEECH_MS = 400        # ignore speech segments shorter than this
-MAX_SEGMENT_S   = 10           # hard cap — transcribe even if no silence detected
+VAD_SILENCE_MS = 700  # ms of silence before we consider speech done
+VAD_MIN_SPEECH_MS = 400  # ignore speech segments shorter than this
+MAX_SEGMENT_S = 10  # hard cap — transcribe even if no silence detected
 # -----------------------
 
 # Wake word gating
-CTRL_PORT           = 12346
-BLEED_SKIP_PACKETS  = 8   # ~256ms of audio to discard after wake word (covers "Elio" utterance bleed)
+CTRL_PORT = 12346
+BLEED_SKIP_PACKETS = 8  # ~256ms of audio to discard after wake word (covers "Elio" utterance bleed)
 
-listen_state      = ListenState.IDLE
-bleed_remaining   = 0
-state_lock        = threading.Lock()
+listen_state = ListenState.IDLE
+bleed_remaining = 0
+state_lock = threading.Lock()
 
 packet_queue: collections.deque = collections.deque()
 vad_queue: collections.deque = collections.deque()
@@ -62,9 +64,9 @@ transcribe_queue: queue.Queue = queue.Queue()
 # --- VAD accumulator state ---
 accumulator: list[np.ndarray] = []
 silence_packets = 0
-SILENCE_THRESHOLD   = NOISE_GATE          # reuse your existing threshold
+SILENCE_THRESHOLD = NOISE_GATE  # reuse your existing threshold
 SILENCE_PACKETS_MAX = int((VAD_SILENCE_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_PKT)
-MIN_SPEECH_PACKETS  = int((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_PKT)
+MIN_SPEECH_PACKETS = int((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_PKT)
 MAX_SEGMENT_PACKETS = int(MAX_SEGMENT_S * SAMPLE_RATE / SAMPLES_PER_PKT)
 
 
@@ -144,7 +146,7 @@ def vad_accumulator_loop() -> None:
 
         if accumulator:
             end_of_speech = (not is_speech) and (silence_packets >= SILENCE_PACKETS_MAX)
-            too_long      = len(accumulator) >= MAX_SEGMENT_PACKETS
+            too_long = len(accumulator) >= MAX_SEGMENT_PACKETS
 
             if end_of_speech or too_long:
                 segment = np.concatenate(accumulator)
@@ -159,6 +161,7 @@ def vad_accumulator_loop() -> None:
                         listen_state = ListenState.IDLE
                 accumulator = []
                 silence_packets = 0
+
 
 def transcription_loop(model: WhisperModel) -> None:
     global listen_state
@@ -189,6 +192,7 @@ def transcription_loop(model: WhisperModel) -> None:
             with state_lock:
                 listen_state = ListenState.IDLE
             print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+
 
 def receive_loop(sock: socket.socket) -> None:
     """Background thread: receive UDP packets and enqueue decoded audio."""
@@ -277,11 +281,11 @@ def main() -> None:
 
     print(f"{ts()} Starting playback. Press Ctrl+C to stop.")
     with sd.OutputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        callback=audio_callback,
-        blocksize=SAMPLES_PER_PKT,
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=audio_callback,
+            blocksize=SAMPLES_PER_PKT,
     ):
         try:
             while True:
