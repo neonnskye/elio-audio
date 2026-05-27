@@ -32,6 +32,7 @@ The firmware streams real-time audio from a MAX9814 analog microphone over Wi-Fi
 - **Framework:** Arduino
 - **Serial baud rate:** 115200
 - **No external library dependencies** — uses only the built-in Arduino ESP32 framework (`WiFi.h`, `WiFiUDP.h`) and ESP-IDF headers (`driver/adc.h`, `esp_wifi.h`)
+- **Python:** requires >= 3.14; managed with `uv`; dev dependency: `ruff`
 
 ## Hardware
 
@@ -46,7 +47,7 @@ The firmware streams real-time audio from a MAX9814 analog microphone over Wi-Fi
 - [platformio.ini](platformio.ini) — board, platform, and framework config
 - [receiver.py](receiver.py) — Python UDP receiver and real-time audio playback
 - [pyproject.toml](pyproject.toml) — Python project config (managed with `uv`)
-- [lib/](lib/) — local libraries; contains `Elio_Wake_v2_inferencing` (Edge Impulse wake-word model)
+- [lib/](lib/) — local libraries; contains `Elio_Wake_v3_inferencing` (Edge Impulse wake-word model)
 - [include/](include/) — shared headers (currently empty)
 - `.pio/` — generated build artifacts and downloaded lib dependencies (not edited manually)
 - `.venv/` — Python virtual environment (managed by `uv`, not edited manually)
@@ -58,8 +59,8 @@ The firmware samples the MAX9814 microphone at **16 kHz** using a hardware timer
 ### Architecture
 
 - **Hardware timer ISR (`onTimer`)** — fires at exactly 16 000 Hz (timer 0, prescaler 5, alarm 1000; derived from 80 MHz CPU clock). Each invocation calls `adc1_get_raw(ADC1_CHANNEL_7)` and stores the 12-bit sample into the active half of the UDP double buffer. When 512 samples are collected the buffer is marked ready and the write pointer swaps to the other half.
-- **Edge Impulse inference buffer** — same ISR also feeds samples (converted to `int16_t` and upscaled by 16) into a second double buffer managed by `ei_inference_t`. When a slice of `EI_CLASSIFIER_SLICE_SIZE` samples is full, `buf_ready` is flagged.
-- **`inferenceTask`** (pinned to core 0) — waits for `ei_inf.buf_ready`, calls `run_classifier_continuous()` with the completed slice, and prints per-label scores. When the `"elio"` label exceeds `0.6`, it lights `LED_BUILTIN` for 500 ms.
+- **Edge Impulse inference buffer** — same ISR also feeds samples (converted to `int16_t` and upscaled by 16) into a second double buffer managed by `ei_inference_t`. When a slice is full, the ISR sends a FreeRTOS task notification (`vTaskNotifyGiveFromISR`) to wake the inference task.
+- **`inferenceTask`** (pinned to core 0) — blocks on `ulTaskNotifyTake` until the ISR signals a slice is ready, then calls `run_classifier_continuous()` and prints per-label scores. When the `"elio"` label exceeds `0.6`, it lights `LED_BUILTIN` for 500 ms and sends a single-byte trigger packet (`0x01`) to the Python receiver via `CTRL_UDP_PORT`.
 - **`loop()`** (core 1) — when a UDP buffer is flagged ready, sends the 1024-byte payload as a single UDP packet to the configured PC IP. Retries on send failure (does not drop packets). Core 1 also hosts the WiFi/UDP stack; splitting inference to core 0 prevents EI processing from delaying packet transmission.
 - **Double buffer** — decouples sampling from sending so the ISR never stalls waiting for UDP transmission.
 - **`esp_wifi_set_ps(WIFI_PS_NONE)`** — disables WiFi modem sleep to reduce RF interference on the ADC.
@@ -68,6 +69,19 @@ The firmware samples the MAX9814 microphone at **16 kHz** using a hardware timer
 
 Each packet is exactly **1024 bytes**: 512 little-endian `uint16_t` samples representing raw 12-bit ADC values (0–4095). The receiver subtracts 2048 (DC midpoint) and normalises to float before playback.
 
+### Wake Word Control Channel
+
+When the Edge Impulse classifier detects the wake word (label `"elio"` > 0.6), the ESP32 sends a 1-byte UDP packet (`0x01`) to `CTRL_UDP_PORT` on the PC. The Python receiver's `control_listener` thread picks this up and drives a `ListenState` state machine:
+
+| State | Description |
+|-------|-------------|
+| `IDLE` | Waiting for wake word signal. Audio is streamed but not transcribed. |
+| `SKIP_WAKEWORD_BLEED` | Discards `BLEED_SKIP_PACKETS` (~256 ms) of audio after the wake word to avoid transcribing the utterance itself. |
+| `CAPTURING` | Actively recording the user's command. VAD accumulator builds a speech segment. |
+| `TRANSCRIBING` | Whisper is processing; new captures are blocked until transcription completes. |
+
+Flow: `IDLE` → (wake packet received) → `SKIP_WAKEWORD_BLEED` → `CAPTURING` → (silence or max segment) → `TRANSCRIBING` → `IDLE`.
+
 ### Configuration (`src/main.cpp` defines)
 
 | Define | Default | Description |
@@ -75,21 +89,19 @@ Each packet is exactly **1024 bytes**: 512 little-endian `uint16_t` samples repr
 | `WIFI_SSID` | — | Wi-Fi network name |
 | `WIFI_PASSWORD` | — | Wi-Fi password |
 | `PC_IP` | — | Receiver's IPv4 address (run `ipconfig` on Windows) |
-| `UDP_PORT` | `12345` | UDP port (must match Python receiver) |
+| `UDP_PORT` | `12345` | UDP port for audio stream (must match Python receiver) |
+| `CTRL_UDP_PORT` | `12346` | UDP port for wake word trigger signal (must match Python `CTRL_PORT`) |
 | `SAMPLES_PER_PKT` | `512` | Samples per UDP packet |
 
 ### Python Backend
 
-The receiver lives at [receiver.py](receiver.py) in this repository. It is a three-threaded design:
+The receiver ([receiver.py](receiver.py)) is a multi-threaded design:
 
-- **Receive thread (`receive_loop`)** — binds UDP socket on port 12345, receives 1024-byte datagrams, decodes `uint16_t` samples to `float32` (subtract DC offset 2048, divide by 2048), and appends decoded audio to two queues:
-  - `packet_queue` — playback queue; packets below the noise-gate RMS are zeroed to suppress idle ADC noise.
-  - `vad_queue` — **original** (non-zeroed) audio for the VAD accumulator.
-  Drops the oldest packet when either queue exceeds its max length.
-- **VAD accumulator thread (`vad_accumulator_loop`)** — polls `vad_queue` and builds speech segments. Accumulation stops after `VAD_SILENCE_MS` of trailing silence or when the segment hits `MAX_SEGMENT_S`. Segments shorter than `VAD_MIN_SPEECH_MS` are discarded; valid segments are pushed to `transcribe_queue`.
-- **Transcription thread (`transcription_loop`)** — pulls completed segments from `transcribe_queue` and runs `faster-whisper` (`base` model, CUDA, float16, English, beam_size=1). Prints the resulting transcript.
-- **sounddevice callback (`audio_callback`)** — called by `sounddevice` to fill output buffers. Drains the `packet_queue` into the output array; carries leftover samples across callbacks to avoid boundary gaps. Outputs silence on underrun.
-- **Pre-buffering** — playback does not start until `PREBUFFER_PKTS = 3` packets (~96 ms) are queued, reducing the chance of an immediate underrun at startup.
+- **`receive_loop`** — receives UDP datagrams, decodes samples, pushes to `packet_queue` (playback, noise-gated) and `vad_queue` (original audio for VAD). Drops oldest on overflow.
+- **`control_listener`** — listens on `CTRL_PORT` for wake word trigger packets from the ESP32; drives the `ListenState` state machine.
+- **`vad_accumulator_loop`** — builds speech segments from `vad_queue` when in `CAPTURING` state; pushes completed segments to `transcribe_queue`.
+- **`transcription_loop`** — runs `faster-whisper` on completed segments and prints transcripts.
+- **`audio_callback`** — `sounddevice` callback; drains `packet_queue` with pre-buffering and leftover-sample carry.
 
 #### Python Configuration (`receiver.py` constants)
 
@@ -100,13 +112,16 @@ The receiver lives at [receiver.py](receiver.py) in this repository. It is a thr
 | `SAMPLES_PER_PKT` | `512` | Must match firmware `SAMPLES_PER_PKT` |
 | `PREBUFFER_PKTS` | `3` | Packets to queue before playback starts (~96 ms) |
 | `MAX_QUEUE_LEN` | `10` | Max queued packets before dropping oldest (~320 ms) |
-| `NOISE_GATE` | `0.02` | RMS threshold below which a packet is silenced (0 = off) |
-| `WHISPER_MODEL` | `"base"` | Whisper model size (`tiny` / `base` / `small`) |
+| `NOISE_GATE` | `0` | RMS threshold below which a packet is silenced (0 = off) |
+| `VAD_SILENCE_THRESHOLD` | `0.03` | RMS threshold below which a packet is considered silence for VAD |
+| `WHISPER_MODEL` | `"turbo"` | Whisper model size (`tiny` / `base` / `small` / `turbo`) |
 | `WHISPER_DEVICE` | `"cuda"` | Inference device (`cuda` or `cpu`) |
 | `WHISPER_COMPUTE` | `"float16"` | Compute precision (`float16` / `int8`) |
-| `VAD_SILENCE_MS` | `700` | Trailing silence required to end a speech segment |
+| `VAD_SILENCE_MS` | `500` | Trailing silence required to end a speech segment |
 | `VAD_MIN_SPEECH_MS` | `400` | Minimum speech length; shorter segments are discarded |
 | `MAX_SEGMENT_S` | `10` | Hard cap — force transcribe even if no silence detected |
+| `CTRL_PORT` | `12346` | UDP port for wake word trigger signal (must match firmware `CTRL_UDP_PORT`) |
+| `BLEED_SKIP_PACKETS` | `8` | Packets to discard after wake word (~256 ms of bleed from the wake utterance) |
 
 #### Running the receiver
 
@@ -133,3 +148,6 @@ Error 12 is `ENOMEM` in lwIP — the UDP send buffer was temporarily unavailable
 
 ### Serial Output During Streaming
 ESP32 prints live counts: `Sent: N | Failed: N`. If `Failed` keeps growing, check network path to receiver.
+
+### PlatformIO Serial Config
+`platformio.ini` sets `monitor_dtr = 0` and `monitor_rts = 0` to prevent the ESP32 from resetting when the serial monitor connects.
