@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "faster-whisper>=1.2.1",
     "numpy>=2.4.4",
+    "ruff>=0.15.14",
     "silero-vad>=6.2.1",
     "sounddevice>=0.5.5",
 ]
