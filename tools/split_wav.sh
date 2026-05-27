@@ -59,6 +59,20 @@ WAV_FILES=("$TARGET_DIR"/*.wav)
 echo "      Done."
 echo "-------------------------------------------"
 
+# Ask if the user also wants to split into 1-second clips
+echo ""
+read -p "Split converted files into 1-second clips? [y/N] " SPLIT_ANSWER
+case "$SPLIT_ANSWER" in
+    [yY]|[yY][eE][sS])
+        echo "Proceeding with splitting..."
+        ;;
+    *)
+        echo "Skipping split. Converted files are in: $TARGET_DIR"
+        echo "Originals backed up to: $RAW_BACKUP_DIR"
+        exit 0
+        ;;
+esac
+
 for f in "${WAV_FILES[@]}"; do
     filename=$(basename "$f")
     base="${filename%.wav}"
