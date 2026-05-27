@@ -1,15 +1,17 @@
 import collections
+import io
 import queue
 import socket
 import sys
 import threading
 import time
+import wave
 from datetime import datetime
 from enum import Enum, auto
 
 import numpy as np
 import sounddevice as sd
-from faster_whisper import WhisperModel
+from groq import Groq
 
 
 def ts() -> str:
@@ -37,10 +39,8 @@ NOISE_GATE = 0  # RMS threshold below which a packet is muted (0 = off)
 VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered silence
 # -----------------------
 
-# Whisper config
-WHISPER_MODEL = "turbo"  # tiny / base / small — tradeoff speed vs accuracy
-WHISPER_DEVICE = "cuda"  # or "cuda" if you have a GPU
-WHISPER_COMPUTE = "float16"  # int8 = fastest on CPU
+# Groq STT config
+GROQ_MODEL = "whisper-large-v3-turbo"
 
 # VAD / segmentation config
 VAD_SILENCE_MS = 500  # ms of silence before we consider speech done
@@ -177,29 +177,48 @@ def vad_accumulator_loop() -> None:
                 silence_packets = 0
 
 
-def transcription_loop(model: WhisperModel) -> None:
+def segment_to_wav(segment: np.ndarray) -> bytes:
+    """Convert a float32 numpy audio array to an in-memory WAV file."""
+    # Clamp to [-1.0, 1.0] and convert to int16
+    clipped = np.clip(segment, -1.0, 1.0)
+    pcm = (clipped * 32767).astype(np.int16)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm.tobytes())
+    buf.seek(0)
+    return buf
+
+
+def transcription_loop() -> None:
     global listen_state
+
+    client = Groq()  # uses GROQ_API_KEY env var
 
     while True:
         segment: np.ndarray = transcribe_queue.get()
 
         try:
             print(
-                f"{ts()} [transcribe] Got segment of {len(segment)} samples, transcribing...",
+                f"{ts()} [transcribe] Got segment of {len(segment)} samples, transcribing via Groq...",
                 flush=True,
             )
-            segments, info = model.transcribe(
-                segment,
+            wav_buf = segment_to_wav(segment)
+            transcription = client.audio.transcriptions.create(
+                file=("segment.wav", wav_buf),
+                model=GROQ_MODEL,
                 language="en",
-                beam_size=1,
-                best_of=1,
+                response_format="text",
                 temperature=0.0,
-                vad_filter=False,
-                condition_on_previous_text=False,
-                word_timestamps=False,
             )
-
-            text = " ".join(s.text.strip() for s in segments).strip()
+            text = (
+                transcription.text
+                if hasattr(transcription, "text")
+                else str(transcription).strip()
+            )
             if text:
                 print(f"{ts()} [transcript] {text}")
         except Exception as exc:
@@ -274,11 +293,7 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
 
 
 def main() -> None:
-    print(f"{ts()} Loading Whisper model '{WHISPER_MODEL}'...")
-    model = WhisperModel(
-        WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE
-    )
-    print(f"{ts()} Model loaded.")
+    print(f"{ts()} Using Groq API model '{GROQ_MODEL}'")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
@@ -289,7 +304,7 @@ def main() -> None:
         (receive_loop, (sock,)),
         (control_listener, ()),
         (vad_accumulator_loop, ()),
-        (transcription_loop, (model,)),
+        (transcription_loop, ()),
     ]:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
