@@ -346,7 +346,7 @@ def llm_loop() -> None:
                     {"role": "user", "content": transcript},
                 ],
                 extra_body={
-                    "provider": {"sort": "latency"},
+                    "provider": {"sort": "throughput"},
                     "preferred_max_latency": {"p90": 2},
                 },
                 stream=True,
