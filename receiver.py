@@ -48,7 +48,7 @@ GROQ_MODEL = "whisper-large-v3-turbo"
 # LLM config
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = "deepseek/deepseek-chat-v3-0324"
+LLM_MODEL = "deepseek/deepseek-v4-flash"
 LLM_SYSTEM_PROMPT = """You are Elio, a friendly and curious robot desk companion.
 You give helpful, conversational responses. Keep replies concise — 2-4 sentences unless the user asks for more detail."""
 
@@ -270,6 +270,10 @@ def llm_loop() -> None:
                     {"role": "system", "content": LLM_SYSTEM_PROMPT},
                     {"role": "user", "content": transcript},
                 ],
+                extra_body={
+                    "provider": {"sort": "latency"},
+                    "preferred_max_latency": {"p90": 2},
+                },
                 stream=True,
             )
             print(f"{ts()} [LLM] ", end="", flush=True)
