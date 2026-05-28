@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "groq>=0.23.0",
     "numpy>=2.4.4",
+    "openai>=2.38.0",
     "ruff>=0.15.14",
     "silero-vad>=6.2.1",
     "sounddevice>=0.5.5",

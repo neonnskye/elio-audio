@@ -1,5 +1,6 @@
 import collections
 import io
+import os
 import queue
 import socket
 import sys
@@ -12,6 +13,7 @@ from enum import Enum, auto
 import numpy as np
 import sounddevice as sd
 from groq import Groq
+from openai import OpenAI
 
 
 def ts() -> str:
@@ -26,6 +28,7 @@ class ListenState(Enum):
     )  # discarding audio bleed from the wake word utterance itself
     CAPTURING = auto()  # actively recording the user's command
     TRANSCRIBING = auto()  # Whisper is processing, block new captures
+    RESPONDING = auto()  # LLM is generating a response
 
 
 # ---- Configuration ----
@@ -41,6 +44,13 @@ VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered
 
 # Groq STT config
 GROQ_MODEL = "whisper-large-v3-turbo"
+
+# LLM config
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+LLM_MODEL = "deepseek/deepseek-chat-v3-0324"
+LLM_SYSTEM_PROMPT = """You are Elio, a friendly and curious robot desk companion.
+You give helpful, conversational responses. Keep replies concise — 2-4 sentences unless the user asks for more detail."""
 
 # VAD / segmentation config
 VAD_SILENCE_MS = 500  # ms of silence before we consider speech done
@@ -60,6 +70,7 @@ state_lock = threading.Lock()
 
 packet_queue: collections.deque = collections.deque()
 vad_queue: collections.deque = collections.deque()
+llm_queue: queue.Queue = queue.Queue()
 queue_lock = threading.Lock()
 leftover: np.ndarray = np.zeros(0, dtype=np.float32)
 
@@ -78,6 +89,9 @@ def control_listener() -> None:
     """Listens on CTRL_PORT for wake word trigger packets from the ESP32."""
     global listen_state, bleed_remaining
 
+    last_wake_time = 0.0
+    WAKE_COOLDOWN_S = 1.5
+
     ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ctrl_sock.bind(("0.0.0.0", CTRL_PORT))
     print(f"{ts()} Control listener ready on port {CTRL_PORT}")
@@ -86,6 +100,11 @@ def control_listener() -> None:
         data, addr = ctrl_sock.recvfrom(16)
         if not data or data[0] != 0x01:
             continue
+
+        now = time.monotonic()
+        if now - last_wake_time < WAKE_COOLDOWN_S:
+            continue
+        last_wake_time = now
 
         with state_lock:
             if listen_state != ListenState.IDLE:
@@ -132,8 +151,8 @@ def vad_accumulator_loop() -> None:
                     print(f"{ts()} [WAKE] Bleed skip done. Capturing command now...")
             continue
 
-        # --- TRANSCRIBING: don't accumulate while Whisper is busy ---
-        if current_state == ListenState.TRANSCRIBING:
+        # --- TRANSCRIBING / RESPONDING: don't accumulate while busy ---
+        if current_state in (ListenState.TRANSCRIBING, ListenState.RESPONDING):
             continue
 
         # --- CAPTURING: normal VAD logic ---
@@ -221,10 +240,47 @@ def transcription_loop() -> None:
             )
             if text:
                 print(f"{ts()} [transcript] {text}")
+                with state_lock:
+                    listen_state = ListenState.RESPONDING
+                llm_queue.put(text)
         except Exception as exc:
             print(f"{ts()} [transcribe error] {exc}", flush=True)
         finally:
-            # Always reset to IDLE so the next wake word can be accepted
+            with state_lock:
+                if listen_state != ListenState.RESPONDING:
+                    listen_state = ListenState.IDLE
+                    print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+
+
+def llm_loop() -> None:
+    global listen_state
+
+    llm_client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
+    )
+
+    while True:
+        transcript: str = llm_queue.get()
+        try:
+            print(f"{ts()} [LLM] Sending to {LLM_MODEL}: {transcript!r}", flush=True)
+            stream = llm_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {"role": "user", "content": transcript},
+                ],
+                stream=True,
+            )
+            print(f"{ts()} [LLM] ", end="", flush=True)
+            for chunk in stream:
+                token = chunk.choices[0].delta.content or ""
+                sys.stdout.write(token)
+                sys.stdout.flush()
+            print()  # newline after streamed response
+        except Exception as exc:
+            print(f"{ts()} [LLM error] {exc}", flush=True)
+        finally:
             with state_lock:
                 listen_state = ListenState.IDLE
             print(f"{ts()} [STATE] Ready. Waiting for wake word...")
@@ -305,6 +361,7 @@ def main() -> None:
         (control_listener, ()),
         (vad_accumulator_loop, ()),
         (transcription_loop, ()),
+        (llm_loop, ()),
     ]:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
