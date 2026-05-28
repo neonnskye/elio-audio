@@ -2,6 +2,7 @@ import collections
 import io
 import os
 import queue
+import re
 import socket
 import sys
 import threading
@@ -93,6 +94,9 @@ Respond in plain, flowing prose only. No bullet points, no numbered lists, no he
 VAD_SILENCE_MS = 500  # ms of silence before we consider speech done
 VAD_MIN_SPEECH_MS = 400  # ignore speech segments shorter than this
 MAX_SEGMENT_S = 10  # hard cap — transcribe even if no silence detected
+CAPTURE_TIMEOUT_S = (
+    3  # seconds of silence after wake word before treating as false positive
+)
 # -----------------------
 
 # Wake word gating
@@ -160,6 +164,8 @@ def control_listener() -> None:
 def vad_accumulator_loop() -> None:
     global accumulator, silence_packets, listen_state, bleed_remaining
 
+    capture_start = 0.0  # timestamp when CAPTURING began
+
     while True:
         chunk = None
         with queue_lock:
@@ -185,6 +191,7 @@ def vad_accumulator_loop() -> None:
                     listen_state = ListenState.CAPTURING
                     accumulator = []
                     silence_packets = 0
+                    capture_start = time.monotonic()
                     print(f"{ts()} [WAKE] Bleed skip done. Capturing command now...")
             continue
 
@@ -201,6 +208,18 @@ def vad_accumulator_loop() -> None:
                 f"\rVAD RMS={rms:.4f} speech={is_speech} acc_len={len(accumulator)} "
             )
             sys.stdout.flush()
+
+        # Capture timeout: if no speech has started within CAPTURE_TIMEOUT_S, false positive
+        if not accumulator and not is_speech:
+            if time.monotonic() - capture_start >= CAPTURE_TIMEOUT_S:
+                print(
+                    f"\n{ts()} [VAD] No speech detected for {CAPTURE_TIMEOUT_S}s — false positive, resetting to IDLE"
+                )
+                with state_lock:
+                    listen_state = ListenState.IDLE
+                accumulator = []
+                silence_packets = 0
+                continue
 
         if is_speech:
             accumulator.append(chunk)
@@ -296,6 +315,18 @@ def transcription_loop() -> None:
                     print(f"{ts()} [STATE] Ready. Waiting for wake word...")
 
 
+def strip_markdown(text: str) -> str:
+    """Remove markdown formatting, keeping only punctuation used in spoken conversation."""
+    text = re.sub(r"#+\s*", "", text)  # headers
+    text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)  # bold/italic
+    text = re.sub(r"_{1,3}([^_]+)_{1,3}", r"\1", text)  # bold/italic (underscore)
+    text = re.sub(r"`{1,3}[^`]*`{1,3}", "", text)  # inline code
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # links [text](url)
+    text = re.sub(r"^[>\-\*]\s*", "", text, flags=re.MULTILINE)  # blockquote/bullet
+    text = re.sub(r"\s{2,}", " ", text)  # collapse multiple spaces
+    return text.strip()
+
+
 def llm_loop() -> None:
     global listen_state
 
@@ -321,11 +352,18 @@ def llm_loop() -> None:
                 stream=True,
             )
             print(f"{ts()} [LLM] ", end="", flush=True)
+            collected = ""
             for chunk in stream:
                 token = chunk.choices[0].delta.content or ""
+                collected += token
                 sys.stdout.write(token)
                 sys.stdout.flush()
-            print()  # newline after streamed response
+            # Sanitize the full response for TTS-friendly output
+            sanitized = strip_markdown(collected)
+            if sanitized != collected:
+                print(f"\n{ts()} [LLM] Sanitized: {sanitized}")
+            else:
+                print()  # newline after streamed response
         except Exception as exc:
             print(f"{ts()} [LLM error] {exc}", flush=True)
         finally:
