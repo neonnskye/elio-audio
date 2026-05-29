@@ -78,9 +78,12 @@ When the Edge Impulse classifier detects the wake word (label `"elio"` > 0.6), t
 | `IDLE` | Waiting for wake word signal. Audio is streamed but not transcribed. |
 | `SKIP_WAKEWORD_BLEED` | Discards `BLEED_SKIP_PACKETS` (~256 ms) of audio after the wake word to avoid transcribing the utterance itself. |
 | `CAPTURING` | Actively recording the user's command. VAD accumulator builds a speech segment. |
-| `TRANSCRIBING` | Whisper is processing; new captures are blocked until transcription completes. |
+| `TRANSCRIBING` | Groq STT (whisper-large-v3-turbo) is transcribing; new captures are blocked. |
+| `RESPONDING` | LLM is generating a response / TTS is synthesizing speech; pipeline busy. |
 
-Flow: `IDLE` → (wake packet received) → `SKIP_WAKEWORD_BLEED` → `CAPTURING` → (silence or max segment) → `TRANSCRIBING` → `IDLE`.
+Flow: `IDLE` → (wake packet received) → `SKIP_WAKEWORD_BLEED` → `CAPTURING` → (silence or max segment) → `TRANSCRIBING` → `RESPONDING` → (TTS playback ends) → `IDLE`.
+
+A `CAPTURE_TIMEOUT_S` (3 s) timer starts when entering `CAPTURING`; if no speech RMS crosses `VAD_SILENCE_THRESHOLD` within that window, the state resets to `IDLE` (false-positive guard).
 
 ### Configuration (`src/main.cpp` defines)
 
@@ -95,13 +98,17 @@ Flow: `IDLE` → (wake packet received) → `SKIP_WAKEWORD_BLEED` → `CAPTURING
 
 ### Python Backend
 
-The receiver ([receiver.py](receiver.py)) is a multi-threaded design:
+The receiver ([receiver.py](receiver.py)) is a multi-threaded design with 6 daemon threads:
 
-- **`receive_loop`** — receives UDP datagrams, decodes samples, pushes to `packet_queue` (playback, noise-gated) and `vad_queue` (original audio for VAD). Drops oldest on overflow.
-- **`control_listener`** — listens on `CTRL_PORT` for wake word trigger packets from the ESP32; drives the `ListenState` state machine.
-- **`vad_accumulator_loop`** — builds speech segments from `vad_queue` when in `CAPTURING` state; pushes completed segments to `transcribe_queue`.
-- **`transcription_loop`** — runs `faster-whisper` on completed segments and prints transcripts.
-- **`audio_callback`** — `sounddevice` callback; drains `packet_queue` with pre-buffering and leftover-sample carry.
+- **`receive_loop`** — receives UDP datagrams, decodes samples (uint16 → float32, DC-offset removed), pushes to `packet_queue` (playback, noise-gated) and `vad_queue` (original audio for VAD). Drops oldest on overflow.
+- **`control_listener`** — listens on `CTRL_PORT` for wake word trigger packets from the ESP32; drives the `ListenState` state machine. Includes a 1.5 s cooldown to debounce repeated triggers.
+- **`vad_accumulator_loop`** — builds speech segments from `vad_queue` when in `CAPTURING` state; pushes completed segments to `transcribe_queue`. Includes false-positive timeout (`CAPTURE_TIMEOUT_S`).
+- **`transcription_loop`** — calls **Groq STT** (`whisper-large-v3-turbo`) on completed segments with a `STT_TIMEOUT_S` (15 s) guard thread. Segments ≤3 words are discarded (wake-word bleed filter).
+- **`llm_loop`** — receives transcripts from `transcription_loop` via `llm_queue`, streams a response from **OpenRouter** (DeepSeek V4 Flash) via the OpenAI SDK. Applies streaming sentence splitting (avoids splitting on abbreviations/initials), markdown stripping, and pushes each complete sentence to `tts_queue`. Timeout safety: `LLM_TOKEN_TIMEOUT_S` (8 s between tokens) + `LLM_TOTAL_TIMEOUT_S` (45 s total).
+- **`tts_loop`** — calls **Groq TTS** (`canopylabs/orpheus-v1-english`, voice `autumn`) on queued LLM sentences with a `TTS_TIMEOUT_S` (20 s) guard. Resamples TTS output from 24 kHz to 16 kHz via `scipy.signal.resample_poly`, then loads chunks into `response_queue` for the audio callback.
+- **`audio_callback`** — `sounddevice` callback. In normal mode drains `packet_queue` (mic passthrough). When `is_responding=True`, drains `response_queue` (TTS audio from LLM) instead. Handles leftover-sample carry between callbacks.
+
+Requires two environment variables: `GROQ_API_KEY` and `OPENROUTER_API_KEY`.
 
 #### Python Configuration (`receiver.py` constants)
 
@@ -114,22 +121,41 @@ The receiver ([receiver.py](receiver.py)) is a multi-threaded design:
 | `MAX_QUEUE_LEN` | `10` | Max queued packets before dropping oldest (~320 ms) |
 | `NOISE_GATE` | `0` | RMS threshold below which a packet is silenced (0 = off) |
 | `VAD_SILENCE_THRESHOLD` | `0.03` | RMS threshold below which a packet is considered silence for VAD |
-| `WHISPER_MODEL` | `"turbo"` | Whisper model size (`tiny` / `base` / `small` / `turbo`) |
-| `WHISPER_DEVICE` | `"cuda"` | Inference device (`cuda` or `cpu`) |
-| `WHISPER_COMPUTE` | `"float16"` | Compute precision (`float16` / `int8`) |
+| `GROQ_MODEL` | `"whisper-large-v3-turbo"` | Groq STT model for transcription |
+| `TTS_MODEL` | `"canopylabs/orpheus-v1-english"` | Groq TTS model |
+| `TTS_VOICE` | `"autumn"` | TTS voice name |
+| `LLM_MODEL` | `"deepseek/deepseek-v4-flash"` | OpenRouter model for LLM responses |
 | `VAD_SILENCE_MS` | `500` | Trailing silence required to end a speech segment |
 | `VAD_MIN_SPEECH_MS` | `400` | Minimum speech length; shorter segments are discarded |
 | `MAX_SEGMENT_S` | `10` | Hard cap — force transcribe even if no silence detected |
+| `CAPTURE_TIMEOUT_S` | `3` | Seconds of silence after wake word before treating as false positive |
 | `CTRL_PORT` | `12346` | UDP port for wake word trigger signal (must match firmware `CTRL_UDP_PORT`) |
 | `BLEED_SKIP_PACKETS` | `8` | Packets to discard after wake word (~256 ms of bleed from the wake utterance) |
+| `STT_TIMEOUT_S` | `15` | Max seconds to wait for Groq STT response |
+| `LLM_TOKEN_TIMEOUT_S` | `8` | Max seconds between tokens in LLM stream |
+| `LLM_TOTAL_TIMEOUT_S` | `45` | Hard cap on total LLM response time |
+| `TTS_TIMEOUT_S` | `20` | Max seconds to wait for Groq TTS response |
 
 #### Running the receiver
 
+Requires two API keys set as environment variables:
+
 ```bash
+# Required: set your API keys before running
+export GROQ_API_KEY="gsk_..."
+export OPENROUTER_API_KEY="sk-or-..."
+
 # Install dependencies (requires uv)
 uv sync
 
 # Run
+uv run receiver.py
+```
+
+On Windows (PowerShell):
+```powershell
+$env:GROQ_API_KEY="gsk_..."
+$env:OPENROUTER_API_KEY="sk-or-..."
 uv run receiver.py
 ```
 
