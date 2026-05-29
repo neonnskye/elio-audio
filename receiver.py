@@ -134,6 +134,9 @@ tts_queue: queue.Queue = queue.Queue()
 # A separate queue to pass completed audio segments to the transcription thread
 transcribe_queue: queue.Queue = queue.Queue()
 
+# Shutdown coordination
+shutdown_event = threading.Event()
+
 # --- VAD accumulator state ---
 accumulator: list[np.ndarray] = []
 silence_packets = 0
@@ -151,10 +154,14 @@ def control_listener() -> None:
 
     ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ctrl_sock.bind(("0.0.0.0", CTRL_PORT))
+    ctrl_sock.settimeout(1.0)
     print(f"{ts()} Control listener ready on port {CTRL_PORT}")
 
-    while True:
-        data, addr = ctrl_sock.recvfrom(16)
+    while not shutdown_event.is_set():
+        try:
+            data, addr = ctrl_sock.recvfrom(16)
+        except socket.timeout:
+            continue
         if not data or data[0] != 0x01:
             continue
 
@@ -182,14 +189,17 @@ def vad_accumulator_loop() -> None:
 
     capture_start = 0.0  # timestamp when CAPTURING began
 
-    while True:
+    while not shutdown_event.is_set():
         chunk = None
         with queue_lock:
             if vad_queue:
                 chunk = vad_queue.popleft()
 
         if chunk is None:
-            time.sleep(0.005)
+            try:
+                shutdown_event.wait(0.005)
+            except KeyboardInterrupt:
+                pass
             continue
 
         with state_lock:
@@ -289,8 +299,13 @@ def transcription_loop() -> None:
 
     client = Groq()  # uses GROQ_API_KEY env var
 
-    while True:
-        segment: np.ndarray = transcribe_queue.get()
+    while not shutdown_event.is_set():
+        try:
+            segment: np.ndarray = transcribe_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if segment is None:
+            break
 
         result_holder = {}  # shared dict to get return value out of thread
 
@@ -381,8 +396,13 @@ def llm_loop() -> None:
         api_key=OPENROUTER_API_KEY,
     )
 
-    while True:
-        transcript: str = llm_queue.get()
+    while not shutdown_event.is_set():
+        try:
+            transcript: str = llm_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if transcript is None:
+            break
         tts_queued = False
         timed_out = False
 
@@ -475,8 +495,13 @@ def tts_loop() -> None:
 
     tts_client = Groq()
 
-    while True:
-        text: str = tts_queue.get()
+    while not shutdown_event.is_set():
+        try:
+            text: str = tts_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if text is None:
+            break
         result_holder = {}
 
         def do_tts():
@@ -552,8 +577,11 @@ def tts_loop() -> None:
 def receive_loop(sock: socket.socket) -> None:
     """Background thread: receive UDP packets and enqueue decoded audio."""
     expected_bytes = SAMPLES_PER_PKT * 2  # uint16 = 2 bytes each
-    while True:
-        data, _ = sock.recvfrom(expected_bytes * 2)
+    while not shutdown_event.is_set():
+        try:
+            data, _ = sock.recvfrom(expected_bytes * 2)
+        except socket.timeout:
+            continue
         if len(data) != expected_bytes:
             continue
         raw = np.frombuffer(data, dtype="<u2").astype(np.float32)
@@ -652,9 +680,11 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
+    sock.settimeout(1.0)
     print(f"{ts()} Listening for UDP audio on port {UDP_PORT}...")
 
     # Start all background threads
+    threads = []
     for target, args in [
         (receive_loop, (sock,)),
         (control_listener, ()),
@@ -665,6 +695,7 @@ def main() -> None:
     ]:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
+        threads.append(t)
 
     print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
     while True:
@@ -681,10 +712,22 @@ def main() -> None:
         blocksize=SAMPLES_PER_PKT,
     ):
         try:
-            while True:
-                sd.sleep(1000)
+            while not shutdown_event.is_set():
+                sd.sleep(200)
         except KeyboardInterrupt:
-            print(f"\n{ts()} Stopped.")
+            print(f"\n{ts()} Shutting down...")
+
+        shutdown_event.set()
+
+        # Unblock any thread stuck on queue.get() with sentinel values
+        llm_queue.put(None)
+        tts_queue.put(None)
+        transcribe_queue.put(None)
+
+        for t in threads:
+            t.join(timeout=3.0)
+
+        print(f"{ts()} All threads stopped. Goodbye.")
 
 
 if __name__ == "__main__":
