@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum, auto
 
 import numpy as np
+import scipy.signal
 import sounddevice as sd
 from groq import Groq
 from openai import OpenAI
@@ -45,6 +46,10 @@ VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered
 
 # Groq STT config
 GROQ_MODEL = "whisper-large-v3-turbo"
+
+# TTS config
+TTS_MODEL = "canopylabs/orpheus-v1-english"
+TTS_VOICE = "autumn"
 
 # LLM config
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -114,6 +119,11 @@ vad_queue: collections.deque = collections.deque()
 llm_queue: queue.Queue = queue.Queue()
 queue_lock = threading.Lock()
 leftover: np.ndarray = np.zeros(0, dtype=np.float32)
+response_queue: collections.deque = collections.deque()
+is_responding: bool = False
+
+# TTS queue for LLM responses to be spoken aloud
+tts_queue: queue.Queue = queue.Queue()
 
 # A separate queue to pass completed audio segments to the transcription thread
 transcribe_queue: queue.Queue = queue.Queue()
@@ -337,6 +347,7 @@ def llm_loop() -> None:
 
     while True:
         transcript: str = llm_queue.get()
+        tts_queued = False
         try:
             print(f"{ts()} [LLM] Sending to {LLM_MODEL}: {transcript!r}", flush=True)
             stream = llm_client.chat.completions.create(
@@ -364,12 +375,77 @@ def llm_loop() -> None:
                 print(f"\n{ts()} [LLM] Sanitized: {sanitized}")
             else:
                 print()  # newline after streamed response
+
+            if sanitized.strip():
+                tts_queue.put(sanitized.strip())
+                tts_queued = True
         except Exception as exc:
             print(f"{ts()} [LLM error] {exc}", flush=True)
         finally:
-            with state_lock:
-                listen_state = ListenState.IDLE
-            print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            if not tts_queued:
+                with state_lock:
+                    listen_state = ListenState.IDLE
+                print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+
+
+def wav_bytes_to_float32(wav_bytes: bytes) -> np.ndarray:
+    """Convert WAV bytes (16-bit PCM) to a float32 numpy array normalized to [-1, 1]."""
+    buf = io.BytesIO(wav_bytes)
+    with wave.open(buf, "rb") as wf:
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+    pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    return pcm / 32768.0
+
+
+def tts_loop() -> None:
+    global listen_state, is_responding
+
+    tts_client = Groq()
+
+    while True:
+        text: str = tts_queue.get()
+        tts_queued = False
+        try:
+            print(f"{ts()} [TTS] Synthesizing {len(text)} chars...", flush=True)
+            response = tts_client.audio.speech.create(
+                model=TTS_MODEL,
+                voice=TTS_VOICE,
+                input=text,
+                response_format="wav",
+            )
+            audio_bytes = response.read()
+            pcm = wav_bytes_to_float32(audio_bytes)
+
+            # Resample from 24kHz (Groq TTS output) to 16kHz (pipeline rate)
+            pcm = scipy.signal.resample_poly(pcm, up=2, down=3)
+
+            with queue_lock:
+                is_responding = True
+
+            for i in range(0, len(pcm), SAMPLES_PER_PKT):
+                chunk = pcm[i : i + SAMPLES_PER_PKT]
+                if len(chunk) < SAMPLES_PER_PKT:
+                    chunk = np.pad(chunk, (0, SAMPLES_PER_PKT - len(chunk)))
+                response_queue.append(chunk)
+
+            response_queue.append(None)  # sentinel: signals end of TTS audio
+            tts_queued = True
+            print(f"{ts()} [TTS] Queued {len(pcm)} samples for playback", flush=True)
+
+        except Exception as exc:
+            print(f"{ts()} [TTS error] {exc}", flush=True)
+        finally:
+            if not tts_queued:
+                # TTS failed — clean up and unblock
+                with queue_lock:
+                    is_responding = False
+                    response_queue.clear()
+                with state_lock:
+                    listen_state = ListenState.IDLE
+                print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+            # If tts_queued is True, audio_callback handles is_responding via sentinel
+            # and resets listen_state after playback completes.
 
 
 def receive_loop(sock: socket.socket) -> None:
@@ -401,35 +477,71 @@ def receive_loop(sock: socket.socket) -> None:
 
 def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
     """sounddevice callback: fill outdata with queued audio, silence on underrun."""
-    global leftover
+    global leftover, is_responding, listen_state
 
     output = np.zeros(frames, dtype=np.float32)
     write_pos = 0
     needed = frames
 
-    # Use leftover samples from previous callback first
-    if len(leftover) > 0:
-        use = min(len(leftover), needed)
-        output[write_pos : write_pos + use] = leftover[:use]
-        leftover = leftover[use:]
-        write_pos += use
-        needed -= use
+    with queue_lock:
+        responding = is_responding
 
-    # Pull packets from queue until we have enough samples
-    while needed > 0:
-        with queue_lock:
-            if not packet_queue:
-                break  # note: should be break, not continue
-            chunk = packet_queue.popleft()
-        if len(chunk) <= needed:
-            output[write_pos : write_pos + len(chunk)] = chunk
-            write_pos += len(chunk)
-            needed -= len(chunk)
-        else:
-            # Chunk is larger than remaining space — save the tail for next callback
-            output[write_pos : write_pos + needed] = chunk[:needed]
-            leftover = chunk[needed:]
-            needed = 0
+    if responding:
+        # Drain TTS audio from response_queue
+        if len(leftover) > 0:
+            use = min(len(leftover), needed)
+            output[write_pos : write_pos + use] = leftover[:use]
+            leftover = leftover[use:]
+            write_pos += use
+            needed -= use
+
+        while needed > 0:
+            with queue_lock:
+                if not response_queue:
+                    break
+                if response_queue[0] is None:
+                    response_queue.popleft()
+                    is_responding = False
+                chunk = response_queue.popleft() if response_queue else None
+
+            if chunk is None:
+                # Sentinel consumed: TTS playback complete
+                leftover = np.zeros(0, dtype=np.float32)
+                with state_lock:
+                    listen_state = ListenState.IDLE
+                break
+
+            if len(chunk) <= needed:
+                output[write_pos : write_pos + len(chunk)] = chunk
+                write_pos += len(chunk)
+                needed -= len(chunk)
+            else:
+                output[write_pos : write_pos + needed] = chunk[:needed]
+                leftover = chunk[needed:]
+                needed = 0
+    else:
+        # Normal mic passthrough — existing logic unchanged
+        if len(leftover) > 0:
+            use = min(len(leftover), needed)
+            output[write_pos : write_pos + use] = leftover[:use]
+            leftover = leftover[use:]
+            write_pos += use
+            needed -= use
+
+        while needed > 0:
+            with queue_lock:
+                if not packet_queue:
+                    break  # note: should be break, not continue
+                chunk = packet_queue.popleft()
+            if len(chunk) <= needed:
+                output[write_pos : write_pos + len(chunk)] = chunk
+                write_pos += len(chunk)
+                needed -= len(chunk)
+            else:
+                # Chunk is larger than remaining space — save the tail for next callback
+                output[write_pos : write_pos + needed] = chunk[:needed]
+                leftover = chunk[needed:]
+                needed = 0
 
     outdata[:, 0] = output
 
@@ -448,6 +560,7 @@ def main() -> None:
         (vad_accumulator_loop, ()),
         (transcription_loop, ()),
         (llm_loop, ()),
+        (tts_loop, ()),
     ]:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
