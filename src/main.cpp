@@ -4,6 +4,8 @@
 #include "esp_wifi.h"
 #include "driver/adc.h"
 #include <driver/i2s.h>
+#include "jbl_begin.h"
+#include "jbl_latency.h"
 
 #define EIDSP_QUANTIZE_FILTERBANK 0
 #include <Elio_Wake_v3_inferencing.h>
@@ -16,6 +18,8 @@
 #define CTRL_UDP_PORT 12346
 #define AUDIO_RX_PORT 12347    // PC sends TTS audio back to this port
 #define PLAYBACK_VOLUME_PCT 90 // volume scale applied to each sample (out of 100)
+#define CHIME_VOLUME_PCT 85    // volume scale applied to chime samples (out of 100)
+#define ESP32_CTRL_RX_PORT 12348 // PC sends control bytes (e.g. 0x02 "transcribing") to this port
 // ----------------------------
 
 #define SAMPLES_PER_PKT 512
@@ -101,6 +105,31 @@ static int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
 WiFiUDP udp;
 WiFiUDP ctrlUdp;
 
+void playChime(const int16_t* samples, uint32_t length_bytes) {
+    isSpeaking = true;
+
+    const uint32_t CHUNK_SAMPLES = SAMPLES_PER_PKT * 2; // stereo: 2 int16 per frame
+    const uint32_t CHUNK_BYTES   = CHUNK_SAMPLES * sizeof(int16_t);
+    static int16_t chimeBuf[SAMPLES_PER_PKT * 2];
+
+    uint32_t offset = 0;
+    while (offset < length_bytes) {
+        uint32_t toRead = min(CHUNK_BYTES, length_bytes - offset);
+        uint32_t sampleCount = toRead / sizeof(int16_t);
+
+        const int16_t* src = samples + (offset / sizeof(int16_t));
+        for (uint32_t i = 0; i < sampleCount; i++) {
+            chimeBuf[i] = (int16_t)((int32_t)src[i] * CHIME_VOLUME_PCT / 100);
+        }
+
+        size_t bytesWritten;
+        i2s_write(I2S_NUM_0, chimeBuf, toRead, &bytesWritten, portMAX_DELAY);
+        offset += toRead;
+    }
+
+    isSpeaking = false;
+}
+
 void inferenceTask(void *arg)
 {
     static bool debug_nn = false;
@@ -150,6 +179,12 @@ void inferenceTask(void *arg)
                     // (prevents acoustic feedback through the microphone)
                     if (!isSpeaking)
                     {
+                        // Play auditory confirmation before notifying PC.
+                        // This ensures the user hears the chime before speaking,
+                        // and that the wake signal arrives only after the chime
+                        // has finished (so PC-side bleed skipping stays accurate).
+                        playChime(jbl_begin, jbl_begin_length);
+
                         uint8_t trigByte = 0x01;
                         ctrlUdp.beginPacket(PC_IP, CTRL_UDP_PORT);
                         ctrlUdp.write(&trigByte, 1);
@@ -206,6 +241,31 @@ void audioPlaybackTask(void *arg)
 
 uint32_t packetsSent = 0;
 uint32_t packetsFailed = 0;
+
+void ctrlListenTask(void *arg)
+{
+    WiFiUDP ctrlRxUdp;
+    ctrlRxUdp.begin(ESP32_CTRL_RX_PORT);
+
+    while (true)
+    {
+        int packetSize = ctrlRxUdp.parsePacket();
+        if (packetSize > 0)
+        {
+            uint8_t byte = 0;
+            ctrlRxUdp.read(&byte, 1);
+
+            if (byte == 0x02 && !isSpeaking)
+            {
+                playChime(jbl_latency, jbl_latency_length);
+            }
+        }
+        else
+        {
+            delay(5);
+        }
+    }
+}
 
 void setup()
 {
@@ -277,6 +337,9 @@ void setup()
 
     // Start audio playback task on core 1 (same as WiFi — spends most time blocked on UDP recv)
     xTaskCreatePinnedToCore(audioPlaybackTask, "AudioRX", 1024 * 8, NULL, 2, NULL, 1);
+
+    // Listen for control bytes from PC (e.g. 0x02 "now transcribing" → play latency chime)
+    xTaskCreatePinnedToCore(ctrlListenTask, "CtrlRX", 1024 * 4, NULL, 1, NULL, 1);
 
     // Timer 0: 80 MHz / prescaler 5 = 16 MHz base clock
     // Alarm at 1000 counts → 16 MHz / 1000 = exactly 16 000 Hz
