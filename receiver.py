@@ -63,6 +63,7 @@ TTS_REFERER = (
     "https://github.com/neonnskye/esp32-audio"  # Optional, for OpenRouter rankings
 )
 TTS_TITLE = "Elio"  # Optional, for OpenRouter rankings
+TTS_PCM_RATE = 24000  # OpenAI TTS PCM output sample rate
 
 # LLM config
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -636,7 +637,7 @@ def tts_loop() -> None:
                     model=TTS_MODEL,
                     voice=TTS_VOICE,
                     input=text,
-                    response_format="wav",
+                    response_format="pcm",
                 ) as response:
                     buf = io.BytesIO()
                     for chunk in response.iter_bytes():
@@ -676,16 +677,18 @@ def tts_loop() -> None:
 
         try:
             audio_bytes = result_holder["audio"]
-            pcm_float, src_rate = wav_bytes_to_float32(audio_bytes)
+            pcm_int16_raw = np.frombuffer(audio_bytes, dtype=np.int16)
+            pcm_float = pcm_int16_raw.astype(np.float32) / 32768.0
+            src_rate = TTS_PCM_RATE
 
-            # Compute exact resampling ratio from actual WAV header rate to pipeline rate
+            # Compute exact resampling ratio from TTS PCM rate to pipeline rate
             # Using GCD reduction ensures resample_poly gets the smallest valid integer ratio
             g = gcd(src_rate, AUDIO_SEND_RATE)
             up = AUDIO_SEND_RATE // g
             down = src_rate // g
 
             print(
-                f"{ts()} [TTS] WAV sample rate: {src_rate}Hz → resampling {down}:{up} to {AUDIO_SEND_RATE}Hz",
+                f"{ts()} [TTS] PCM sample rate: {src_rate}Hz → resampling {down}:{up} to {AUDIO_SEND_RATE}Hz",
                 flush=True,
             )
 
