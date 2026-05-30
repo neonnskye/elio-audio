@@ -57,8 +57,8 @@ AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pa
 GROQ_MODEL = "whisper-large-v3-turbo"
 
 # TTS config
-TTS_MODEL = "openai/gpt-4o-mini-tts-2025-12-15"
-TTS_VOICE = "nova"
+TTS_MODEL = "hexgrad/kokoro-82m"
+TTS_VOICE = "af_bella"
 TTS_REFERER = (
     "https://github.com/neonnskye/esp32-audio"  # Optional, for OpenRouter rankings
 )
