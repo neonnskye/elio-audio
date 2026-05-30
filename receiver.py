@@ -162,7 +162,7 @@ CONVERSATION_HISTORY_MAX_TURNS = (
 # Wake word gating
 CTRL_PORT = 12346
 BLEED_SKIP_PACKETS = (
-    8  # ~256ms of audio to discard after wake word (covers "Elio" utterance bleed)
+    24  # ~768ms: covers "elio" utterance bleed (~256ms) + begin chime (~512ms)
 )
 
 listen_state = ListenState.IDLE

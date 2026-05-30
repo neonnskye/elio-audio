@@ -179,16 +179,16 @@ void inferenceTask(void *arg)
                     // (prevents acoustic feedback through the microphone)
                     if (!isSpeaking)
                     {
-                        // Play auditory confirmation before notifying PC.
-                        // This ensures the user hears the chime before speaking,
-                        // and that the wake signal arrives only after the chime
-                        // has finished (so PC-side bleed skipping stays accurate).
-                        playChime(jbl_begin, jbl_begin_length);
-
+                        // Notify PC first so it starts its bleed-skip window
+                        // immediately. The chime plays after — its duration is
+                        // covered by BLEED_SKIP_PACKETS on the receiver side,
+                        // so no speech is lost.
                         uint8_t trigByte = 0x01;
                         ctrlUdp.beginPacket(PC_IP, CTRL_UDP_PORT);
                         ctrlUdp.write(&trigByte, 1);
                         ctrlUdp.endPacket();
+
+                        playChime(jbl_begin, jbl_begin_length);
                     }
                 }
             }
