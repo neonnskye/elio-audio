@@ -16,9 +16,9 @@
 #define PC_IP "172.20.10.5"
 #define UDP_PORT 12345
 #define CTRL_UDP_PORT 12346
-#define AUDIO_RX_PORT 12347    // PC sends TTS audio back to this port
-#define PLAYBACK_VOLUME_PCT 90 // volume scale applied to each sample (out of 100)
-#define CHIME_VOLUME_PCT 85    // volume scale applied to chime samples (out of 100)
+#define AUDIO_RX_PORT 12347      // PC sends TTS audio back to this port
+#define PLAYBACK_VOLUME_PCT 95   // volume scale applied to each sample (out of 100)
+#define CHIME_VOLUME_PCT 95      // volume scale applied to chime samples (out of 100)
 #define ESP32_CTRL_RX_PORT 12348 // PC sends control bytes (e.g. 0x02 "transcribing") to this port
 // ----------------------------
 
@@ -105,20 +105,23 @@ static int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
 WiFiUDP udp;
 WiFiUDP ctrlUdp;
 
-void playChime(const int16_t* samples, uint32_t length_bytes) {
+void playChime(const int16_t *samples, uint32_t length_bytes)
+{
     isSpeaking = true;
 
     const uint32_t CHUNK_SAMPLES = SAMPLES_PER_PKT * 2; // stereo: 2 int16 per frame
-    const uint32_t CHUNK_BYTES   = CHUNK_SAMPLES * sizeof(int16_t);
+    const uint32_t CHUNK_BYTES = CHUNK_SAMPLES * sizeof(int16_t);
     static int16_t chimeBuf[SAMPLES_PER_PKT * 2];
 
     uint32_t offset = 0;
-    while (offset < length_bytes) {
+    while (offset < length_bytes)
+    {
         uint32_t toRead = min(CHUNK_BYTES, length_bytes - offset);
         uint32_t sampleCount = toRead / sizeof(int16_t);
 
-        const int16_t* src = samples + (offset / sizeof(int16_t));
-        for (uint32_t i = 0; i < sampleCount; i++) {
+        const int16_t *src = samples + (offset / sizeof(int16_t));
+        for (uint32_t i = 0; i < sampleCount; i++)
+        {
             chimeBuf[i] = (int16_t)((int32_t)src[i] * CHIME_VOLUME_PCT / 100);
         }
 
