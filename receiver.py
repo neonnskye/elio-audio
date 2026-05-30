@@ -44,6 +44,14 @@ NOISE_GATE = 0  # RMS threshold below which a packet is muted (0 = off)
 VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered silence
 # -----------------------
 
+# Audio output routing
+AUDIO_OUTPUT = "esp32"  # "local" | "esp32" | "both"
+ESP32_IP = "172.20.10.3"  # must match IP printed by ESP32 on boot — adjust if different
+ESP32_AUDIO_PORT = 12347
+AUDIO_SEND_CHUNK = 512  # samples per UDP packet
+AUDIO_SEND_RATE = 16000  # Hz
+AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pacing
+
 # Groq STT config
 GROQ_MODEL = "whisper-large-v3-turbo"
 
@@ -136,6 +144,9 @@ transcribe_queue: queue.Queue = queue.Queue()
 
 # Shutdown coordination
 shutdown_event = threading.Event()
+
+# UDP socket for sending TTS audio to ESP32
+audio_send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # --- VAD accumulator state ---
 accumulator: list[np.ndarray] = []
@@ -527,6 +538,48 @@ def wav_bytes_to_float32(wav_bytes: bytes) -> np.ndarray:
     return pcm / 32768.0
 
 
+def send_audio_esp32(pcm_int16: np.ndarray) -> None:
+    """Send int16 PCM audio to the ESP32 over UDP, paced to real-time."""
+    for i in range(0, len(pcm_int16), AUDIO_SEND_CHUNK):
+        chunk = pcm_int16[i : i + AUDIO_SEND_CHUNK]
+        if len(chunk) < AUDIO_SEND_CHUNK:
+            chunk = np.pad(chunk, (0, AUDIO_SEND_CHUNK - len(chunk)))
+        audio_send_sock.sendto(chunk.tobytes(), (ESP32_IP, ESP32_AUDIO_PORT))
+        time.sleep(AUDIO_SEND_SLEEP)
+
+
+def play_audio_local(pcm_int16: np.ndarray) -> None:
+    """Queue int16 PCM audio for local playback via sounddevice.
+    PCM data is expected to be at 16kHz (resampled upstream in tts_loop).
+    """
+    global is_responding
+    pcm_float = pcm_int16.astype(np.float32) / 32768.0
+    with queue_lock:
+        is_responding = True
+        for i in range(0, len(pcm_float), SAMPLES_PER_PKT):
+            chunk = pcm_float[i : i + SAMPLES_PER_PKT]
+            if len(chunk) < SAMPLES_PER_PKT:
+                chunk = np.pad(chunk, (0, SAMPLES_PER_PKT - len(chunk)))
+            response_queue.append(chunk)
+        response_queue.append(None)  # sentinel signals end of playback
+
+
+def play_audio(pcm_int16: np.ndarray) -> None:
+    """Route int16 PCM audio to the configured output(s)."""
+    global listen_state
+    if AUDIO_OUTPUT == "local":
+        play_audio_local(pcm_int16)
+    elif AUDIO_OUTPUT == "esp32":
+        send_audio_esp32(pcm_int16)
+        with state_lock:
+            listen_state = ListenState.IDLE
+        print(f"{ts()} [STATE] Ready. Waiting for wake word...")
+    elif AUDIO_OUTPUT == "both":
+        # Local playback is non-blocking (just queues), so run it first
+        play_audio_local(pcm_int16)
+        send_audio_esp32(pcm_int16)
+
+
 def tts_loop() -> None:
     global listen_state, is_responding
 
@@ -584,22 +637,19 @@ def tts_loop() -> None:
 
         try:
             audio_bytes = result_holder["audio"]
-            pcm = wav_bytes_to_float32(audio_bytes)
+            pcm_float = wav_bytes_to_float32(audio_bytes)
 
             # Resample from 24kHz (Groq TTS output) to 16kHz (pipeline rate)
-            pcm = scipy.signal.resample_poly(pcm, up=2, down=3)
+            pcm_resampled = scipy.signal.resample_poly(pcm_float, up=2, down=3)
 
-            with queue_lock:
-                is_responding = True
+            # Convert to int16 for routing to ESP32 and/or local playback
+            pcm_int16 = (pcm_resampled * 32767).clip(-32768, 32767).astype(np.int16)
 
-            for i in range(0, len(pcm), SAMPLES_PER_PKT):
-                chunk = pcm[i : i + SAMPLES_PER_PKT]
-                if len(chunk) < SAMPLES_PER_PKT:
-                    chunk = np.pad(chunk, (0, SAMPLES_PER_PKT - len(chunk)))
-                response_queue.append(chunk)
-
-            response_queue.append(None)  # sentinel: signals end of TTS audio
-            print(f"{ts()} [TTS] Queued {len(pcm)} samples for playback", flush=True)
+            play_audio(pcm_int16)
+            print(
+                f"{ts()} [TTS] Queued {len(pcm_resampled)} samples for playback ({AUDIO_OUTPUT})",
+                flush=True,
+            )
 
         except Exception as exc:
             print(f"{ts()} [TTS error] (post-synthesis) {exc}", flush=True)
