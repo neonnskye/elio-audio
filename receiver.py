@@ -10,6 +10,7 @@ import time
 import wave
 from datetime import datetime
 from enum import Enum, auto
+from math import gcd
 
 import numpy as np
 import scipy.signal
@@ -528,14 +529,17 @@ def llm_loop() -> None:
                 print(f"{ts()} [STATE] Ready. Waiting for wake word...")
 
 
-def wav_bytes_to_float32(wav_bytes: bytes) -> np.ndarray:
-    """Convert WAV bytes (16-bit PCM) to a float32 numpy array normalized to [-1, 1]."""
+def wav_bytes_to_float32(wav_bytes: bytes) -> tuple[np.ndarray, int]:
+    """Convert WAV bytes (16-bit PCM) to a float32 numpy array normalized to [-1, 1].
+    Returns (pcm_float32, sample_rate_hz).
+    """
     buf = io.BytesIO(wav_bytes)
     with wave.open(buf, "rb") as wf:
+        sample_rate = wf.getframerate()
         n_frames = wf.getnframes()
         raw = wf.readframes(n_frames)
     pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-    return pcm / 32768.0
+    return pcm / 32768.0, sample_rate
 
 
 def send_audio_esp32(pcm_int16: np.ndarray) -> None:
@@ -637,10 +641,17 @@ def tts_loop() -> None:
 
         try:
             audio_bytes = result_holder["audio"]
-            pcm_float = wav_bytes_to_float32(audio_bytes)
+            pcm_float, src_rate = wav_bytes_to_float32(audio_bytes)
 
-            # Resample from 24kHz (Groq TTS output) to 16kHz (pipeline rate)
-            pcm_resampled = scipy.signal.resample_poly(pcm_float, up=2, down=3)
+            # Compute exact resampling ratio from actual WAV header rate to pipeline rate
+            # Using GCD reduction ensures resample_poly gets the smallest valid integer ratio
+            g = gcd(src_rate, AUDIO_SEND_RATE)
+            up = AUDIO_SEND_RATE // g
+            down = src_rate // g
+
+            print(f"{ts()} [TTS] WAV sample rate: {src_rate}Hz → resampling {down}:{up} to {AUDIO_SEND_RATE}Hz", flush=True)
+
+            pcm_resampled = scipy.signal.resample_poly(pcm_float, up=up, down=down)
 
             # Convert to int16 for routing to ESP32 and/or local playback
             pcm_int16 = (pcm_resampled * 32767).clip(-32768, 32767).astype(np.int16)
