@@ -107,7 +107,9 @@ static int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
 WiFiUDP udp;
 WiFiUDP ctrlUdp;
 
-void playChime(const int16_t *samples, uint32_t length_bytes)
+void playChime(const int16_t *samples,
+               uint32_t length_bytes,
+               volatile bool *keepPlaying = NULL)
 {
     isSpeaking = true;
 
@@ -118,6 +120,9 @@ void playChime(const int16_t *samples, uint32_t length_bytes)
     uint32_t offset = 0;
     while (offset < length_bytes)
     {
+        if (keepPlaying && !(*keepPlaying))
+            break;
+
         uint32_t toRead = min(CHUNK_BYTES, length_bytes - offset);
         uint32_t sampleCount = toRead / sizeof(int16_t);
 
@@ -226,7 +231,16 @@ void audioPlaybackTask(void *arg)
             int samplesRead = bytesRead / sizeof(int16_t);
 
             if (chimeLooping)
+            {
                 chimeLooping = false;
+
+                while (chimeTaskHandle != NULL)
+                {
+                    vTaskDelay(1);
+                }
+
+                i2s_zero_dma_buffer(I2S_NUM_0);
+            }
             isSpeaking = true;
             lastPacketMs = millis();
 
@@ -286,7 +300,7 @@ void chimeLoopTask(void *arg)
 {
     while (chimeLooping)
     {
-        playChime(jbl_latency, jbl_latency_length);
+        playChime(jbl_latency, jbl_latency_length, &chimeLooping);
     }
     chimeTaskHandle = NULL;
     vTaskDelete(NULL);
@@ -308,9 +322,9 @@ void ctrlListenTask(void *arg)
             if (byte == 0x02 && !isSpeaking)
             {
                 chimeLooping = false;
-                if (chimeTaskHandle != NULL)
+                while (chimeTaskHandle != NULL)
                 {
-                    vTaskDelay(pdMS_TO_TICKS(100));
+                    vTaskDelay(1);
                 }
 
                 chimeLooping = true;
@@ -326,6 +340,13 @@ void ctrlListenTask(void *arg)
             else if (byte == 0x03)
             {
                 chimeLooping = false;
+
+                while (chimeTaskHandle != NULL)
+                {
+                    vTaskDelay(1);
+                }
+
+                i2s_zero_dma_buffer(I2S_NUM_0);
             }
         }
         else
