@@ -426,6 +426,7 @@ def transcription_loop() -> None:
                 print(
                     f"{ts()} [transcribe] Too short ({word_count} words), discarding: {text!r}"
                 )
+                send_chime_stop()
                 with state_lock:
                     listen_state = ListenState.IDLE
             else:
@@ -636,6 +637,17 @@ def send_audio_esp32(pcm_int16: np.ndarray) -> None:
         time.sleep(AUDIO_SEND_SLEEP)
 
 
+def send_chime_stop() -> None:
+    """Tell the ESP32 to stop the latency chime loop.
+    Called on any pipeline path that resets to IDLE without sending TTS audio.
+    The ESP32 handles 0x03 as an immediate chime-loop stop signal.
+    """
+    try:
+        audio_send_sock.sendto(bytes([0x03]), (ESP32_IP, ESP32_CTRL_TX_PORT))
+    except Exception as exc:
+        print(f"{ts()} [CTRL] Failed to send chime stop: {exc}", flush=True)
+
+
 def play_audio_local(pcm_int16: np.ndarray) -> None:
     """Queue int16 PCM audio for local playback via sounddevice.
     PCM data is expected to be at 16kHz (resampled upstream in tts_loop).
@@ -731,6 +743,7 @@ def tts_loop() -> None:
                 f"{ts()} [TTS] TIMEOUT after {TTS_TIMEOUT_S}s — resetting to IDLE",
                 flush=True,
             )
+            send_chime_stop()
             with queue_lock:
                 is_responding = False
                 response_queue.clear()
@@ -741,6 +754,7 @@ def tts_loop() -> None:
 
         if "error" in result_holder:
             print(f"{ts()} [TTS error] {result_holder['error']}", flush=True)
+            send_chime_stop()
             with queue_lock:
                 is_responding = False
                 response_queue.clear()

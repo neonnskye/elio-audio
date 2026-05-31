@@ -34,6 +34,8 @@ portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 hw_timer_t *timer = NULL;
 
 volatile bool isSpeaking = false;
+volatile bool chimeLooping = false;
+static TaskHandle_t chimeTaskHandle = NULL;
 
 // EI inference double-buffer (fed from the timer ISR, consumed by inference task)
 typedef struct
@@ -218,6 +220,11 @@ void audioPlaybackTask(void *arg)
             int bytesRead = audioRxUdp.read((uint8_t *)rxBuf, sizeof(rxBuf));
             int samplesRead = bytesRead / sizeof(int16_t);
 
+            if (chimeLooping)
+            {
+                chimeLooping = false;
+            }
+
             isSpeaking = true;
             lastPacketMs = millis();
 
@@ -245,6 +252,16 @@ void audioPlaybackTask(void *arg)
 uint32_t packetsSent = 0;
 uint32_t packetsFailed = 0;
 
+void chimeLoopTask(void *arg)
+{
+    while (chimeLooping)
+    {
+        playChime(jbl_latency, jbl_latency_length);
+    }
+    chimeTaskHandle = NULL;
+    vTaskDelete(NULL);
+}
+
 void ctrlListenTask(void *arg)
 {
     WiFiUDP ctrlRxUdp;
@@ -260,7 +277,25 @@ void ctrlListenTask(void *arg)
 
             if (byte == 0x02 && !isSpeaking)
             {
-                playChime(jbl_latency, jbl_latency_length);
+                chimeLooping = false;
+                if (chimeTaskHandle != NULL)
+                {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+
+                chimeLooping = true;
+                xTaskCreatePinnedToCore(
+                    chimeLoopTask,
+                    "ChimeLoop",
+                    1024 * 4,
+                    NULL,
+                    1,
+                    &chimeTaskHandle,
+                    1);
+            }
+            else if (byte == 0x03)
+            {
+                chimeLooping = false;
             }
         }
         else
@@ -339,7 +374,7 @@ void setup()
     xTaskCreatePinnedToCore(inferenceTask, "EI_Infer", 1024 * 48, NULL, 1, &inferenceTaskHandle, 0);
 
     // Start audio playback task on core 1 (same as WiFi — spends most time blocked on UDP recv)
-    xTaskCreatePinnedToCore(audioPlaybackTask, "AudioRX", 1024 * 8, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(audioPlaybackTask, "AudioRX", 1024 * 8, NULL, 3, NULL, 1);
 
     // Listen for control bytes from PC (e.g. 0x02 "now transcribing" → play latency chime)
     xTaskCreatePinnedToCore(ctrlListenTask, "CtrlRX", 1024 * 4, NULL, 1, NULL, 1);
