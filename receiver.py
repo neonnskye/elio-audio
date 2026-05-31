@@ -15,6 +15,7 @@ from math import gcd
 import numpy as np
 import scipy.signal
 import sounddevice as sd
+import torch
 from groq import Groq
 from openai import OpenAI
 
@@ -42,7 +43,7 @@ SAMPLES_PER_PKT = 512
 PREBUFFER_PKTS = 3  # Packets to queue before starting playback (~96ms)
 MAX_QUEUE_LEN = 10  # Drop oldest if queue grows beyond this (~320ms)
 NOISE_GATE = 0  # RMS threshold below which a packet is muted (0 = off)
-VAD_SILENCE_THRESHOLD = 0.03  # RMS threshold below which a packet is considered silence
+SILERO_VAD_THRESHOLD = 0.5  # Silero VAD speech probability threshold
 # -----------------------
 
 # Audio output routing
@@ -205,6 +206,8 @@ SILENCE_PACKETS_MAX = int((VAD_SILENCE_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_PK
 MIN_SPEECH_PACKETS = int((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_PKT)
 MAX_SEGMENT_PACKETS = int(MAX_SEGMENT_S * SAMPLE_RATE / SAMPLES_PER_PKT)
 
+vad_model = None
+
 
 def control_listener() -> None:
     """Listens on CTRL_PORT for wake word trigger packets from the ESP32."""
@@ -245,6 +248,21 @@ def control_listener() -> None:
         )
 
 
+def load_silero_vad() -> None:
+    """Load the Silero VAD model at startup."""
+    global vad_model
+    print(f"{ts()} Loading Silero VAD model...", flush=True)
+    model, _ = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        force_reload=False,
+        trust_repo=True,
+    )
+    model.eval()
+    vad_model = model
+    print(f"{ts()} Silero VAD model loaded.", flush=True)
+
+
 def vad_accumulator_loop() -> None:
     global accumulator, silence_packets, listen_state, bleed_remaining
 
@@ -279,6 +297,7 @@ def vad_accumulator_loop() -> None:
                     accumulator = []
                     silence_packets = 0
                     capture_start = time.monotonic()
+                    vad_model.reset_states()  # reset internal LSTM state for new session
                     print(f"{ts()} [WAKE] Bleed skip done. Capturing command now...")
             continue
 
@@ -286,15 +305,18 @@ def vad_accumulator_loop() -> None:
         if current_state in (ListenState.TRANSCRIBING, ListenState.RESPONDING):
             continue
 
-        # --- CAPTURING: normal VAD logic ---
-        rms = float(np.sqrt(np.mean(chunk**2)))
-        is_speech = rms >= VAD_SILENCE_THRESHOLD
+        # --- CAPTURING: Silero VAD logic ---
+        audio_tensor = torch.from_numpy(chunk).float().unsqueeze(0)  # (1, 512)
 
-        if rms > 0.001:
-            sys.stdout.write(
-                f"\rVAD RMS={rms:.4f} speech={is_speech} acc_len={len(accumulator)} "
-            )
-            sys.stdout.flush()
+        with torch.no_grad():
+            speech_prob = vad_model(audio_tensor, SAMPLE_RATE).item()
+
+        is_speech = speech_prob >= SILERO_VAD_THRESHOLD
+
+        sys.stdout.write(
+            f"\rVAD prob={speech_prob:.3f} speech={is_speech} acc_len={len(accumulator)} "
+        )
+        sys.stdout.flush()
 
         # Capture timeout: if no speech has started within CAPTURE_TIMEOUT_S, false positive
         if not accumulator and not is_speech:
@@ -306,6 +328,7 @@ def vad_accumulator_loop() -> None:
                     listen_state = ListenState.IDLE
                 accumulator = []
                 silence_packets = 0
+                vad_model.reset_states()
                 continue
 
         if is_speech:
@@ -329,7 +352,6 @@ def vad_accumulator_loop() -> None:
                     with state_lock:
                         listen_state = ListenState.TRANSCRIBING
                     transcribe_queue.put(segment)
-                    # Notify ESP32 that speech has ended — triggers the "thinking" chime
                     audio_send_sock.sendto(
                         bytes([0x02]), (ESP32_IP, ESP32_CTRL_TX_PORT)
                     )
@@ -341,6 +363,7 @@ def vad_accumulator_loop() -> None:
                         listen_state = ListenState.IDLE
                 accumulator = []
                 silence_packets = 0
+                vad_model.reset_states()  # reset internal LSTM state — session done
 
 
 def segment_to_wav(segment: np.ndarray) -> bytes:
@@ -962,6 +985,8 @@ def main() -> None:
     print(
         f"{ts()} Using Groq STT model '{GROQ_MODEL}', OpenRouter TTS model '{TTS_MODEL}'"
     )
+
+    load_silero_vad()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
