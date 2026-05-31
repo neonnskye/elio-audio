@@ -55,7 +55,7 @@ AUDIO_SEND_RATE = 16000  # Hz
 AUDIO_SEND_SLEEP = AUDIO_SEND_CHUNK / AUDIO_SEND_RATE  # 0.032s — real-time pacing
 
 # Groq STT config
-GROQ_MODEL = "whisper-large-v3-turbo"
+GROQ_MODEL = "whisper-large-v3"
 
 # TTS config
 TTS_MODEL = "hexgrad/kokoro-82m"
@@ -917,6 +917,47 @@ def audio_callback(outdata: np.ndarray, frames: int, time, status) -> None:
     outdata[:, 0] = output
 
 
+def warmup_connections() -> None:
+    """Fire a silent warmup request to the DeepSeek LLM on startup.
+
+    DeepSeek caches the KV state of the system prompt after the first call.
+    Subsequent calls with the same system prompt get a cache hit, which is
+    the main source of first-interaction latency. This primes that cache
+    before the user ever speaks. Runs in a daemon thread; never touches
+    pipeline state, history, or ESP32 audio.
+    """
+    print(f"{ts()} [WARMUP] Priming DeepSeek prompt cache...", flush=True)
+
+    llm_client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=OPENROUTER_API_KEY,
+    )
+
+    try:
+        t0 = time.monotonic()
+        stream = llm_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": "Hey Elio, how are you doing?"},
+            ],
+            extra_body={
+                "provider": {"sort": "throughput"},
+                "preferred_max_latency": {"p90": 2},
+            },
+            stream=True,
+            max_tokens=60,
+        )
+        # Drain the stream fully so the system prompt KV cache is committed
+        for _ in stream:
+            pass
+        print(
+            f"{ts()} [WARMUP] Cache primed ({time.monotonic() - t0:.2f}s)", flush=True
+        )
+    except Exception as exc:
+        print(f"{ts()} [WARMUP] Warmup failed (non-fatal): {exc}", flush=True)
+
+
 def main() -> None:
     print(
         f"{ts()} Using Groq STT model '{GROQ_MODEL}', OpenRouter TTS model '{TTS_MODEL}'"
@@ -941,6 +982,12 @@ def main() -> None:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
         threads.append(t)
+
+    # Fire warmup in background — don't block startup or the pre-buffer wait
+    warmup_thread = threading.Thread(
+        target=warmup_connections, daemon=True, name="Warmup"
+    )
+    warmup_thread.start()
 
     print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
     while True:
