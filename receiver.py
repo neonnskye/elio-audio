@@ -352,6 +352,13 @@ def vad_accumulator_loop() -> None:
                     with state_lock:
                         listen_state = ListenState.TRANSCRIBING
                     transcribe_queue.put(segment)
+                    # Turn off the listen LED — user has finished speaking.
+                    # 0x03 doubles as chime-stop; at this point the chime loop
+                    # hasn't started yet (0x02 fires after), so on the ESP32 side
+                    # this only has the LED effect.
+                    audio_send_sock.sendto(
+                        bytes([0x03]), (ESP32_IP, ESP32_CTRL_TX_PORT)
+                    )
                     audio_send_sock.sendto(
                         bytes([0x02]), (ESP32_IP, ESP32_CTRL_TX_PORT)
                     )

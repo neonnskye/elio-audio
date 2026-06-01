@@ -34,6 +34,7 @@ portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 hw_timer_t *timer = NULL;
 
 volatile bool isSpeaking = false;
+volatile bool isListening = false; // true from wake word until VAD end (0x03)
 volatile bool chimeLooping = false;
 static TaskHandle_t chimeTaskHandle = NULL;
 
@@ -143,19 +144,11 @@ void playChime(const int16_t *samples,
 void inferenceTask(void *arg)
 {
     static bool debug_nn = false;
-    static uint32_t ledOffAt = 0;
 
     while (true)
     {
         // Block indefinitely until the ISR sends a notification
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        // Turn off LED if blink duration has elapsed (non-blocking)
-        if (ledOffAt > 0 && millis() >= ledOffAt)
-        {
-            digitalWrite(LED_BUILTIN, LOW);
-            ledOffAt = 0;
-        }
 
         signal_t signal;
         signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
@@ -181,14 +174,18 @@ void inferenceTask(void *arg)
                     result.classification[i].value > 0.6f)
                 {
                     Serial.println(">>> WAKE WORD DETECTED <<<");
-                    digitalWrite(LED_BUILTIN, HIGH);
-                    ledOffAt = millis() + 500; // schedule off, don't block
 
                     // Notify Python server that wake word was detected
                     // Suppress the trigger while ESP32 is playing its own audio
                     // (prevents acoustic feedback through the microphone)
                     if (!isSpeaking)
                     {
+                        // Turn on LED immediately; it will stay on until the
+                        // PC signals VAD end (0x03), at which point ctrlListenTask
+                        // turns it off.
+                        isListening = true;
+                        digitalWrite(LED_BUILTIN, HIGH);
+
                         // Notify PC first so it starts its bleed-skip window
                         // immediately. The chime plays after — its duration is
                         // covered by BLEED_SKIP_PACKETS on the receiver side,
@@ -347,6 +344,13 @@ void ctrlListenTask(void *arg)
                 }
 
                 i2s_zero_dma_buffer(I2S_NUM_0);
+
+                // VAD has ended — user has stopped speaking, turn off listen LED
+                if (isListening)
+                {
+                    isListening = false;
+                    digitalWrite(LED_BUILTIN, LOW);
+                }
             }
         }
         else
