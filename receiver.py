@@ -1015,10 +1015,15 @@ def main() -> None:
     warmup_thread.start()
 
     print(f"{ts()} Waiting for {PREBUFFER_PKTS} packets to pre-buffer...")
+    deadline = time.monotonic() + 10.0  # wait at most 10 seconds
     while True:
         with queue_lock:
             if len(packet_queue) >= PREBUFFER_PKTS:
                 break
+        if time.monotonic() > deadline:
+            print(f"{ts()} WARNING: No audio from ESP32 after 10s — continuing anyway.")
+            break
+        time.sleep(0.01)
 
     print(f"{ts()} Starting playback. Press Ctrl+C to stop.")
     with sd.OutputStream(
