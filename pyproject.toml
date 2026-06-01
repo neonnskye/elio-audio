@@ -3,7 +3,7 @@ name = "esp32-audio"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
     "groq>=1.4.0",
     "openai>=2.38.0",
@@ -13,3 +13,23 @@ dependencies = [
     "torch>=2.12.0",
     "torchaudio>=2.11.0",
 ]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
+    { index = "pytorch-cu130", marker = "platform_machine != 'aarch64' and sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", marker = "platform_machine == 'aarch64'" },
+    { index = "pytorch-cu130", marker = "platform_machine != 'aarch64' and sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
