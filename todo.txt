@@ -1,3 +1,7 @@
 [audio]
-INMP441
+multiple "ready" lines after split TTS
+doesn't always cleanly turn off LED (false positive, no py script, etc.)
+dataset in more noisy environment
+INMP441 + PCB
+optimize system prompt for specific use cases / queries / commands
 rhythm detection
