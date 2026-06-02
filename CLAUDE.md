@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The project targets the NodeMCU-32S board using the Arduino framework. Two options:
 
 ### Arduino IDE
-- Open `esp32-audio.ino` in Arduino IDE
+- Open `elio-audio.ino` in Arduino IDE
 - Install ESP32 board package via Boards Manager (`esp32` by Espressif)
 - Select board: **NodeMCU-32S** (or generic `ESP32 DEV Module`)
 - Select port and click Upload
@@ -16,10 +16,10 @@ The project targets the NodeMCU-32S board using the Arduino framework. Two optio
 ### Arduino CLI (optional)
 ```bash
 # Build
-arduino-cli compile --fqbn esp32:esp32:nodemcu-32s esp32-audio.ino
+arduino-cli compile --fqbn esp32:esp32:nodemcu-32s elio-audio.ino
 
 # Upload
-arduino-cli upload --fqbn esp32:esp32:nodemcu-32s --port <PORT> esp32-audio.ino
+arduino-cli upload --fqbn esp32:esp32:nodemcu-32s --port <PORT> elio-audio.ino
 
 # Monitor serial output
 arduino-cli monitor --port <PORT> --config 115200
@@ -44,7 +44,7 @@ The firmware streams real-time audio from a MAX9814 analog microphone over Wi-Fi
 
 ## Code Structure
 
-- [esp32-audio.ino](esp32-audio.ino) — single entry point; Arduino `setup()` and `loop()`
+- [elio-audio.ino](elio-audio.ino) — single entry point; Arduino `setup()` and `loop()`
 - [jbl_begin.h](jbl_begin.h) — begin chime WAV data (wake word confirmation sound)
 - [jbl_latency.h](jbl_latency.h) — latency chime WAV data (STT/LLM gap fill)
 - [todo.txt](todo.txt) — known issues and upcoming work
@@ -91,7 +91,7 @@ When entering `CAPTURING`, the PC sends `0x02` to ESP32 to start a looping laten
 
 A `CAPTURE_TIMEOUT_S` (3 s) timer starts when entering `CAPTURING`; if no speech is detected by **Silero VAD** within that window, the state resets to `IDLE` (false-positive guard).
 
-### Configuration (`esp32-audio.ino` defines)
+### Configuration (`elio-audio.ino` defines)
 
 | Define | Default | Description |
 |--------|---------|-------------|
