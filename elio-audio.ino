@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
+#include <ESPmDNS.h>
 #include <WiFiUDP.h>
 #include "esp_wifi.h"
 #include "driver/adc.h"
@@ -13,10 +15,13 @@
 #include <Elio_Wake_v3_inferencing.h>
 
 // ---- User configuration ----
-#define WIFI_SSID "Amrith’s iPhone"
-#define WIFI_PASSWORD "brat summer"
-#define PC_IP "172.20.10.5" // 172.20.10.2 for Raspberry Pi
-#define MQTT_BROKER         PC_IP   // broker runs on same machine as receiver.py
+#define WIFI_SSID_1    "Amrith’s iPhone"
+#define WIFI_PASS_1    "brat summer"
+#define WIFI_SSID_2    "Slt2657"
+#define WIFI_PASS_2    "Amrith@123"
+#define PC_MDNS_HOST   "raspberrypi"
+#define ESP32_MDNS_HOST "esp32-audio"
+#define MQTT_BROKER    "127.0.0.1"   // broker runs locally on the Pi
 #define MQTT_PORT           1883
 #define MQTT_ID             "elio-esp32"
 #define TOPIC_WAKE          "elio/wake"
@@ -120,6 +125,8 @@ WiFiUDP udp;
 
 WiFiClient  wifiClient;
 PubSubClient mqttClient(wifiClient);
+WiFiMulti wifiMulti;
+IPAddress pcIP;
 
 void playChime(const int16_t *samples,
                uint32_t length_bytes,
@@ -384,16 +391,40 @@ void setup()
     adc1_config_width(ADC_WIDTH_BIT_12);
     adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_12);
 
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
+    wifiMulti.addAP(WIFI_SSID_2, WIFI_PASS_2);
     Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED)
+    while (wifiMulti.run() != WL_CONNECTED)
     {
         delay(500);
         Serial.print(".");
     }
     Serial.println();
-    Serial.print("Connected, IP: ");
-    Serial.println(WiFi.localIP());
+    Serial.printf("Connected to %s, IP: %s\n",
+        WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+    // Start mDNS — advertise this device as esp32-audio.local
+    if (!MDNS.begin(ESP32_MDNS_HOST))
+        Serial.println("mDNS init failed");
+    else
+        Serial.printf("mDNS started: %s.local\n", ESP32_MDNS_HOST);
+
+    // Resolve PC/Pi IP via mDNS
+    Serial.printf("Resolving %s.local via mDNS...\n", PC_MDNS_HOST);
+    for (int attempt = 0; attempt < 15; attempt++)
+    {
+        pcIP = MDNS.queryHost(PC_MDNS_HOST);
+        if (pcIP.toString() != "0.0.0.0") break;
+        Serial.print(".");
+        delay(1000);
+    }
+    if (pcIP.toString() == "0.0.0.0")
+    {
+        Serial.println("\nmDNS resolution failed for " PC_MDNS_HOST
+                       " — halting. Check avahi/Bonjour on the host.");
+        while (true) delay(1000);
+    }
+    Serial.printf("\nResolved %s.local -> %s\n", PC_MDNS_HOST, pcIP.toString().c_str());
 
     // Give lwIP time to populate ARP table and prepare UDP send buffers
     Serial.println("Waiting for network to stabilize...");
@@ -403,7 +434,7 @@ void setup()
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     // MQTT setup — must be after WiFi is connected
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    mqttClient.setServer(pcIP, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
     mqttReconnect();
 
@@ -487,7 +518,7 @@ void loop()
     if (toSend < 0)
         return; // another core beat us here (defensive)
 
-    if (udp.beginPacket(PC_IP, UDP_PORT) == 0)
+    if (udp.beginPacket(pcIP, UDP_PORT) == 0)
     {
         packetsFailed++;
         delay(5);
