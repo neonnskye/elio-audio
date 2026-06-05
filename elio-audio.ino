@@ -366,19 +366,21 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 
 void mqttReconnect()
 {
-    while (!mqttClient.connected())
+    // Single attempt per call — loop() drives retries every iteration.
+    // This keeps the loop() responsive (mDNS retries, UDP sends) even when
+    // the broker is temporarily unreachable.
+    if (mqttClient.connected())
+        return;
+    Serial.print("Connecting to MQTT broker...");
+    if (mqttClient.connect(MQTT_ID))
     {
-        Serial.print("Connecting to MQTT broker...");
-        if (mqttClient.connect(MQTT_ID))
-        {
-            Serial.println(" connected.");
-            mqttClient.subscribe(TOPIC_CTRL);
-        }
-        else
-        {
-            Serial.printf(" failed (rc=%d). Retry in 2s.\n", mqttClient.state());
-            delay(2000);
-        }
+        Serial.println(" connected.");
+        mqttClient.subscribe(TOPIC_CTRL);
+    }
+    else
+    {
+        Serial.printf(" failed (rc=%d). Will retry next loop.\n", mqttClient.state());
+        delay(500); // brief back-off; non-blocking relative to loop() cadence
     }
 }
 
@@ -409,7 +411,9 @@ void setup()
     else
         Serial.printf("mDNS started: %s.local\n", ESP32_MDNS_HOST);
 
-    // Resolve PC/Pi IP via mDNS
+    // Resolve PC/Pi IP via mDNS.
+    // We do a best-effort attempt here but do NOT halt if it fails —
+    // resolvePcIP() will keep retrying from loop() until it succeeds.
     Serial.printf("Resolving %s.local via mDNS...\n", PC_MDNS_HOST);
     for (int attempt = 0; attempt < 15; attempt++)
     {
@@ -420,11 +424,13 @@ void setup()
     }
     if (pcIP.toString() == "0.0.0.0")
     {
-        Serial.println("\nmDNS resolution failed for " PC_MDNS_HOST
-                       " — halting. Check avahi/Bonjour on the host.");
-        while (true) delay(1000);
+        Serial.println("\nmDNS resolution failed at boot — will keep retrying in loop().");
+        Serial.println("Start receiver.py on the Pi; the ESP32 will connect automatically.");
     }
-    Serial.printf("\nResolved %s.local -> %s\n", PC_MDNS_HOST, pcIP.toString().c_str());
+    else
+    {
+        Serial.printf("\nResolved %s.local -> %s\n", PC_MDNS_HOST, pcIP.toString().c_str());
+    }
 
     // Give lwIP time to populate ARP table and prepare UDP send buffers
     Serial.println("Waiting for network to stabilize...");
@@ -433,10 +439,13 @@ void setup()
     // Disable WiFi modem sleep to reduce ADC interference from radio bursts
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    // MQTT setup — must be after WiFi is connected
+    // MQTT setup — only connect if we already have the broker IP.
+    // If pcIP is still 0.0.0.0 (Pi not running), loop() will resolve it
+    // and call mqttReconnect() automatically once the IP is known.
     mqttClient.setServer(pcIP, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
-    mqttReconnect();
+    if (pcIP.toString() != "0.0.0.0")
+        mqttReconnect();
 
     ei_inf.n_samples = EI_CLASSIFIER_SLICE_SIZE;
     ei_inf.buffers[0] = (int16_t *)malloc(EI_CLASSIFIER_SLICE_SIZE * sizeof(int16_t));
@@ -496,8 +505,42 @@ void setup()
     Serial.println(packetsFailed);
 }
 
+// Attempt a single mDNS resolution of the PC hostname.
+// Returns true if pcIP was (re-)resolved successfully.
+// Called at boot and from loop() whenever pcIP is still 0.0.0.0.
+bool resolvePcIP()
+{
+    IPAddress resolved = MDNS.queryHost(PC_MDNS_HOST, 1000); // 1-second timeout
+    if (resolved.toString() == "0.0.0.0")
+        return false;
+    if (resolved != pcIP)
+    {
+        Serial.printf("[mDNS] Resolved %s.local -> %s\n", PC_MDNS_HOST, resolved.toString().c_str());
+        pcIP = resolved;
+        // Update MQTT broker address and force a reconnect so it uses the new IP
+        mqttClient.setServer(pcIP, MQTT_PORT);
+        mqttClient.disconnect();
+    }
+    return true;
+}
+
 void loop()
 {
+    // If pcIP was not resolved at boot (Pi wasn't running yet), keep retrying
+    // every 3 seconds until it succeeds. Everything else is gated on pcIP being valid.
+    if (pcIP.toString() == "0.0.0.0")
+    {
+        static uint32_t lastResolveAttemptMs = 0;
+        if (millis() - lastResolveAttemptMs > 3000)
+        {
+            lastResolveAttemptMs = millis();
+            Serial.printf("[mDNS] Retrying %s.local resolution...\n", PC_MDNS_HOST);
+            resolvePcIP();
+        }
+        delay(10);
+        return; // nothing else can work without the PC IP
+    }
+
     if (!mqttClient.connected())
         mqttReconnect();
     mqttClient.loop();
