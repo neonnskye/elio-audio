@@ -3,6 +3,8 @@
 #include <WiFiMulti.h>
 #include <ESPmDNS.h>
 #include <WiFiUDP.h>
+#include <Wire.h>
+#include <U8g2lib.h>
 #include "esp_wifi.h"
 #include "driver/adc.h"
 #include <driver/i2s.h>
@@ -15,10 +17,12 @@
 #include <Elio_Wake_v3.1_inferencing.h>
 
 // ---- User configuration ----
-#define WIFI_SSID_1    "Amrith’s iPhone"
-#define WIFI_PASS_1    "brat summer"
-#define WIFI_SSID_2    "Slt2657"
-#define WIFI_PASS_2    "Amrith@123"
+#define WIFI_SSID_1    "Vismi"
+#define WIFI_PASS_1    "111111111"
+#define WIFI_SSID_2    "Amrith’s iPhone"
+#define WIFI_PASS_2    "brat summer"
+#define WIFI_SSID_3    "Slt2657"
+#define WIFI_PASS_3    "Amrith@123"
 #define PC_MDNS_HOST   "raspberrypi"
 #define ESP32_MDNS_HOST "esp32-audio"
 #define MQTT_BROKER    "127.0.0.1"   // broker runs locally on the Pi
@@ -26,6 +30,7 @@
 #define MQTT_ID             "elio-esp32"
 #define TOPIC_WAKE          "elio/wake"
 #define TOPIC_CTRL          "elio/ctrl"
+#define TOPIC_ROBOT_EMOTION "luna/robot/emotion"
 #define UDP_PORT 12345
 #define AUDIO_RX_PORT 12347      // PC sends TTS audio back to this port
 #define PLAYBACK_VOLUME_PCT 95   // volume scale applied to each sample (out of 100)
@@ -37,6 +42,20 @@
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2
 #endif
+
+// ================= OLED DISPLAY =================
+// IMPORTANT: GPIO22 is already used by MAX98357A DATA OUT in this code.
+// So OLED uses custom I2C pins:
+// OLED VCC -> ESP32 3.3V
+// OLED GND -> ESP32 GND
+// OLED SDA -> ESP32 GPIO21
+// OLED SCL -> ESP32 GPIO19
+#define OLED_SDA 21
+#define OLED_SCL 19
+
+U8G2_SH1107_128X128_F_HW_I2C u8g2(U8G2_R3, U8X8_PIN_NONE);
+
+String currentEmotion = "HAPPY";
 
 #define SAMPLES_PER_PKT 512
 
@@ -320,12 +339,137 @@ void chimeLoopTask(void *arg)
     vTaskDelete(NULL);
 }
 
+// ================= OLED EMOTION FACES =================
+
+void drawLabel(const char *text)
+{
+    u8g2.setFont(u8g2_font_6x12_tf);
+    int w = u8g2.getStrWidth(text);
+    u8g2.drawStr((128 - w) / 2, 122, text);
+}
+
+void drawHappy()
+{
+    u8g2.clearBuffer();
+
+    // Round eyes
+    u8g2.drawDisc(44, 55, 14);
+    u8g2.drawDisc(84, 55, 14);
+
+    // Pupils
+    u8g2.setDrawColor(0);
+    u8g2.drawDisc(44, 55, 5);
+    u8g2.drawDisc(84, 55, 5);
+    u8g2.setDrawColor(1);
+
+    // Smiling mouth
+    u8g2.drawCircle(64, 84, 16, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
+
+    drawLabel("HAPPY");
+    u8g2.sendBuffer();
+}
+
+void drawSad()
+{
+    u8g2.clearBuffer();
+
+    // Droopy eyes
+    u8g2.drawLine(30, 60, 58, 64);
+    u8g2.drawLine(70, 64, 98, 60);
+
+    // Upside-down mouth
+    u8g2.drawCircle(64, 92, 16, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+
+    drawLabel("SAD");
+    u8g2.sendBuffer();
+}
+
+void drawAngry()
+{
+    u8g2.clearBuffer();
+
+    // Sharp angry eyes
+    u8g2.drawLine(30, 45, 58, 58);
+    u8g2.drawLine(98, 45, 70, 58);
+
+    // Tight mouth
+    u8g2.drawBox(46, 85, 36, 5);
+
+    drawLabel("ANGRY");
+    u8g2.sendBuffer();
+}
+
+void drawLove()
+{
+    u8g2.clearBuffer();
+
+    // Heart-like eyes using text
+    u8g2.setFont(u8g2_font_ncenB18_tr);
+    u8g2.drawStr(31, 62, "<3");
+    u8g2.drawStr(76, 62, "<3");
+
+    // Soft smile
+    u8g2.setFont(u8g2_font_6x12_tf);
+    u8g2.drawCircle(64, 88, 15, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
+
+    drawLabel("LOVE");
+    u8g2.sendBuffer();
+}
+
+void drawEmergency()
+{
+    u8g2.clearBuffer();
+
+    // Wide eyes
+    u8g2.drawCircle(44, 55, 16);
+    u8g2.drawCircle(84, 55, 16);
+
+    // Alarm O mouth
+    u8g2.drawCircle(64, 88, 12);
+
+    u8g2.setFont(u8g2_font_6x12_tf);
+    u8g2.drawStr(28, 110, "EMERGENCY");
+
+    u8g2.sendBuffer();
+}
+
+void showEmotion(String emotion)
+{
+    emotion.trim();
+    emotion.toUpperCase();
+
+    currentEmotion = emotion;
+
+    if (emotion == "HAPPY")
+        drawHappy();
+    else if (emotion == "SAD")
+        drawSad();
+    else if (emotion == "ANGRY")
+        drawAngry();
+    else if (emotion == "LOVE")
+        drawLove();
+    else if (emotion == "EMERGENCY")
+        drawEmergency();
+    else
+        drawHappy();
+}
+
+
 void mqttCallback(char* topic, byte* payload, unsigned int length)
 {
     // Build a null-terminated string from the payload bytes
     char msg[32] = {0};
     unsigned int copy = (length < sizeof(msg) - 1) ? length : sizeof(msg) - 1;
     memcpy(msg, payload, copy);
+
+    // OLED emotion command from main robot ESP
+    if (strcmp(topic, TOPIC_ROBOT_EMOTION) == 0)
+    {
+        Serial.print("[OLED] Emotion received: ");
+        Serial.println(msg);
+        showEmotion(String(msg));
+        return;
+    }
 
     if (strcmp(topic, TOPIC_CTRL) != 0)
         return; // ignore any topic we didn't subscribe to
@@ -376,6 +520,8 @@ void mqttReconnect()
     {
         Serial.println(" connected.");
         mqttClient.subscribe(TOPIC_CTRL);
+        mqttClient.subscribe(TOPIC_ROBOT_EMOTION);
+        showEmotion("HAPPY");
     }
     else
     {
@@ -388,13 +534,30 @@ void setup()
 {
     Serial.begin(115200);
 
+    // OLED init
+    Wire.begin(OLED_SDA, OLED_SCL);
+    u8g2.begin();
+    showEmotion("HAPPY");
+
     // Configure ADC via IDF API (GPIO 35 = ADC1 channel 7)
     // 12-bit resolution, 11 dB attenuation = full 0–3.3 V input range
     adc1_config_width(ADC_WIDTH_BIT_12);
     adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_12);
 
+    // WiFi priority: Yasiru first, then backup networks
     wifiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
     wifiMulti.addAP(WIFI_SSID_2, WIFI_PASS_2);
+    wifiMulti.addAP(WIFI_SSID_3, WIFI_PASS_3);
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
+
+    Serial.println("Available WiFi list:");
+    Serial.println("1) " WIFI_SSID_1);
+    Serial.println("2) " WIFI_SSID_2);
+    Serial.println("3) " WIFI_SSID_3);
+
     Serial.print("Connecting to WiFi");
     while (wifiMulti.run() != WL_CONNECTED)
     {
