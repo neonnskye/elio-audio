@@ -31,6 +31,7 @@
 #define TOPIC_WAKE          "elio/wake"
 #define TOPIC_CTRL          "elio/ctrl"
 #define TOPIC_ROBOT_EMOTION "luna/robot/emotion"
+#define TOPIC_SYSTEM_READY  "elio/system/ready"
 #define UDP_PORT 12345
 #define AUDIO_RX_PORT 12347      // PC sends TTS audio back to this port
 #define PLAYBACK_VOLUME_PCT 95   // volume scale applied to each sample (out of 100)
@@ -71,6 +72,10 @@ hw_timer_t *timer = NULL;
 volatile bool isSpeaking = false;
 volatile bool isListening = false; // true from wake word until VAD end (0x03)
 volatile bool chimeLooping = false;
+// Set to true when Python publishes elio/system/ready; cleared on MQTT disconnect.
+// Wake word triggers are suppressed until Python is ready — no point waking
+// if there is nobody listening on the other end.
+volatile bool pythonReady = false;
 static TaskHandle_t chimeTaskHandle = NULL;
 
 // EI inference double-buffer (fed from the timer ISR, consumed by inference task)
@@ -217,7 +222,7 @@ void inferenceTask(void *arg)
                     // Notify Python server that wake word was detected
                     // Suppress the trigger while ESP32 is playing its own audio
                     // (prevents acoustic feedback through the microphone)
-                    if (!isSpeaking)
+                    if (!isSpeaking && pythonReady)
                     {
                         // Turn on LED immediately; it will stay on until the
                         // PC signals "stop" via MQTT on elio/ctrl, at which point
@@ -232,6 +237,11 @@ void inferenceTask(void *arg)
                         mqttClient.publish(TOPIC_WAKE, "1");
 
                         playChime(jbl_begin, jbl_begin_length);
+                    }
+                    else if (!isSpeaking && !pythonReady)
+                    {
+                        // Python server not ready yet — silently ignore the wake word
+                        Serial.println("[Wake] Python not ready yet — ignoring wake word.");
                     }
                 }
             }
@@ -471,6 +481,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
         return;
     }
 
+    // Python readiness signal — set/clear pythonReady so we know whether to
+    // forward wake words.  An empty retained payload means Python shut down.
+    if (strcmp(topic, TOPIC_SYSTEM_READY) == 0)
+    {
+        bool wasReady = pythonReady;
+        pythonReady = (length > 0 && msg[0] != '\0');
+        if (pythonReady && !wasReady)
+            Serial.println("[MQTT] Python server ready — wake word enabled.");
+        else if (!pythonReady && wasReady)
+            Serial.println("[MQTT] Python server went offline — wake word suppressed.");
+        return;
+    }
+
     if (strcmp(topic, TOPIC_CTRL) != 0)
         return; // ignore any topic we didn't subscribe to
 
@@ -515,12 +538,22 @@ void mqttReconnect()
     // the broker is temporarily unreachable.
     if (mqttClient.connected())
         return;
+    // Lost the broker connection — Python may have gone down.  Reset the
+    // readiness flag so wake words are suppressed until Python re-announces.
+    if (pythonReady)
+    {
+        pythonReady = false;
+        Serial.println("[MQTT] Broker connection lost — pythonReady cleared.");
+    }
     Serial.print("Connecting to MQTT broker...");
     if (mqttClient.connect(MQTT_ID))
     {
         Serial.println(" connected.");
         mqttClient.subscribe(TOPIC_CTRL);
         mqttClient.subscribe(TOPIC_ROBOT_EMOTION);
+        // Subscribe with retained delivery so we get the last system/ready
+        // value immediately — even if Python published it before we connected.
+        mqttClient.subscribe(TOPIC_SYSTEM_READY);
         showEmotion("HAPPY");
     }
     else
