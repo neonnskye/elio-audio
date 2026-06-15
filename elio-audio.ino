@@ -6,7 +6,6 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include "esp_wifi.h"
-#include "driver/adc.h"
 #include <driver/i2s.h>
 #include "jbl_begin.h"
 #include "jbl_latency.h"
@@ -66,9 +65,6 @@ volatile int writeBuf = 0;
 volatile int writeIdx = 0;
 volatile int readyBuf = -1;
 
-portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-hw_timer_t *timer = NULL;
-
 volatile bool isSpeaking = false;
 volatile bool isListening = false; // true from wake word until VAD end (0x03)
 volatile bool chimeLooping = false;
@@ -91,46 +87,77 @@ typedef struct
 static ei_inference_t ei_inf;
 static TaskHandle_t inferenceTaskHandle = NULL;
 
-// ISR: fires at exactly 16 000 Hz, reads one ADC sample, swaps buffer when full.
-// adc1_get_raw() is called outside the spinlock to keep the critical section minimal.
-void IRAM_ATTR onTimer()
+// ---- INMP441 I2S RX pin config ----
+#define I2S_MIC_SCK   32
+#define I2S_MIC_WS    33
+#define I2S_MIC_SD    34
+
+void micCaptureTask(void *arg)
 {
-    uint16_t sample = (uint16_t)adc1_get_raw(ADC1_CHANNEL_7);
+    // Open I2S_NUM_1 for INMP441 capture
+    i2s_config_t mic_cfg = {
+        .mode           = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate    = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // INMP441 outputs 32-bit frames
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // LR pin tied to GND → left ch
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count  = 4,
+        .dma_buf_len    = SAMPLES_PER_PKT,
+        .use_apll       = false,
+        .tx_desc_auto_clear = false,
+    };
 
-    // Do arithmetic OUTSIDE the lock
-    // (cheap optimization, avoids extra work while holding spinlock)
-    int16_t s16 = (int16_t)(sample - 2048) * 16;
+    i2s_pin_config_t mic_pins = {
+        .mck_io_num   = I2S_PIN_NO_CHANGE,   // INMP441 has no MCLK pin
+        .bck_io_num   = I2S_MIC_SCK,
+        .ws_io_num    = I2S_MIC_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num  = I2S_MIC_SD,
+    };
 
-    portENTER_CRITICAL_ISR(&mux);
+    i2s_driver_install(I2S_NUM_1, &mic_cfg, 0, NULL);
+    i2s_set_pin(I2S_NUM_1, &mic_pins);
 
-    // UDP buffer
-    buf[writeBuf][writeIdx++] = sample;
-    if (writeIdx >= SAMPLES_PER_PKT)
+    // Read buffer: 32-bit samples from I2S
+    static int32_t i2sBuf[SAMPLES_PER_PKT];
+
+    while (true)
     {
-        writeIdx = 0;
-        readyBuf = writeBuf;
-        writeBuf ^= 1;
-    }
+        size_t bytesRead = 0;
+        i2s_read(I2S_NUM_1, i2sBuf, sizeof(i2sBuf), &bytesRead, portMAX_DELAY);
+        int samplesRead = bytesRead / sizeof(int32_t);
 
-    // EI inference buffer
-    ei_inf.buffers[ei_inf.buf_select][ei_inf.buf_count++] = s16;
-
-    if (ei_inf.buf_count >= ei_inf.n_samples)
-    {
-        ei_inf.buf_select ^= 1;
-        ei_inf.buf_count = 0;
-
-        // Notify inference task instead of setting a flag
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        vTaskNotifyGiveFromISR(inferenceTaskHandle, &xHigherPriorityTaskWoken);
-
-        if (xHigherPriorityTaskWoken)
+        for (int i = 0; i < samplesRead; i++)
         {
-            portYIELD_FROM_ISR();
+            // Shift 32-bit I2S word down to 16-bit signed PCM.
+            // The INMP441 places valid data in bits [31:14]; >> 14 centres it.
+            int16_t s16 = (int16_t)(i2sBuf[i] >> 14);
+
+            // UDP double-buffer (uint16_t wire format — reinterpret cast)
+            buf[writeBuf][writeIdx++] = (uint16_t)(uint16_t)s16;
+            if (writeIdx >= SAMPLES_PER_PKT)
+            {
+                writeIdx = 0;
+                readyBuf = writeBuf;
+                writeBuf ^= 1;
+            }
+
+            // EI inference buffer
+            ei_inf.buffers[ei_inf.buf_select][ei_inf.buf_count++] = s16;
+
+            if (ei_inf.buf_count >= ei_inf.n_samples)
+            {
+                ei_inf.buf_select ^= 1;
+                ei_inf.buf_count = 0;
+
+                BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                vTaskNotifyGiveFromISR(inferenceTaskHandle, &xHigherPriorityTaskWoken);
+                if (xHigherPriorityTaskWoken)
+                    portYIELD_FROM_ISR();
+            }
         }
     }
-
-    portEXIT_CRITICAL_ISR(&mux);
 }
 
 static int ei_get_data(size_t offset, size_t length, float *out_ptr)
@@ -572,11 +599,6 @@ void setup()
     u8g2.begin();
     showEmotion("HAPPY");
 
-    // Configure ADC via IDF API (GPIO 35 = ADC1 channel 7)
-    // 12-bit resolution, 11 dB attenuation = full 0–3.3 V input range
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_12);
-
     // WiFi priority: Yasiru first, then backup networks
     wifiMulti.addAP(WIFI_SSID_1, WIFI_PASS_1);
     wifiMulti.addAP(WIFI_SSID_2, WIFI_PASS_2);
@@ -687,12 +709,8 @@ void setup()
     // Start audio playback task on core 1 (same as WiFi — spends most time blocked on UDP recv)
     xTaskCreatePinnedToCore(audioPlaybackTask, "AudioRX", 1024 * 8, NULL, 3, NULL, 1);
 
-    // v3 timer API: timerBegin takes the desired frequency directly (Hz).
-    // timerAlarm replaces timerAlarmWrite + timerAlarmEnable:
-    //   pass period = 1 tick at 16 000 Hz → fires at exactly 16 000 Hz.
-    timer = timerBegin(16000);             // 16 000 Hz timer clock
-    timerAttachInterrupt(timer, &onTimer); // no 'edge' argument in v3
-    timerAlarm(timer, 1, true, 0);         // fire every 1 tick = 16 000 Hz, auto-reload, unlimited
+    // Start INMP441 capture task on core 0 alongside inference
+    xTaskCreatePinnedToCore(micCaptureTask, "MicCapture", 1024 * 4, NULL, 2, NULL, 0);
 
     Serial.println("Streaming audio...");
     Serial.print("Sent: ");
@@ -748,11 +766,8 @@ void loop()
     }
 
     // Atomically claim and clear readyBuf before doing any UDP work
-    int toSend;
-    portENTER_CRITICAL(&mux);
-    toSend = readyBuf;
-    readyBuf = -1; // clear immediately so ISR can reuse the slot
-    portEXIT_CRITICAL(&mux);
+    int toSend = readyBuf;
+    readyBuf = -1; // clear immediately so micCaptureTask can reuse the slot
 
     if (toSend < 0)
         return; // another core beat us here (defensive)
